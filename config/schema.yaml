@@ -1,0 +1,172 @@
+# config/schema.yaml
+# IBP Trade-Off Engine — canonical data contract
+# Step 0 (Foundations). Frozen before generate_data.py is written.
+# Two layers: raw.* is what arrives (defects included); canonical.* is what
+# the cleaner must produce. src/cleaner.py implements the mapping between them.
+
+meta:
+  project: ibp-tradeoff
+  schema_version: 0.1
+  base_currency: EUR
+  base_uom: units          # cases are converted on ingest via sku_master.case_size
+  calendar_grain: month
+  history_months: 36
+  horizon_months: 12
+  scope:
+    plants: 3
+    lines: 4
+    skus: 60
+    categories: 3
+    forecast_lags: [1, 2, 3]   # months ahead at which the plan was made
+
+# ---------------------------------------------------------------------------
+# RAW LAYER — as extracted. Column names are deliberately inconsistent.
+# ---------------------------------------------------------------------------
+raw:
+
+  sku_master:
+    file: data/raw/sku_master.csv
+    grain: [source_system, source_sku_code]
+    columns:
+      source_system:     {dtype: string, values: [A, B]}
+      source_sku_code:   {dtype: string, note: "NOT unique across systems — see defects"}
+      description:       {dtype: string}
+      category:          {dtype: string, note: "free text, inconsistent casing"}
+      abc_class:         {dtype: string, values: [A, B, C], nullable: true}
+      plant_code:        {dtype: string}
+      line_code:         {dtype: string}
+      uom:               {dtype: string, values: [EA, CS]}
+      case_size:         {dtype: int, note: "units per case; 1 where uom == EA"}
+      price:             {dtype: float, note: "in source currency"}
+      std_cost:          {dtype: float, note: "in source currency"}
+      shelf_life_days:   {dtype: int}
+      moq:               {dtype: float, note: "in source uom"}
+      min_run_qty:       {dtype: float, note: "in source uom"}
+
+  system_a:
+    file: data/raw/plant_system_A.csv
+    covers: [PLANT1, PLANT2]
+    grain: [MATERIAL, PLANT, PERIOD]
+    columns:
+      MATERIAL:      {dtype: string}
+      PLANT:         {dtype: string}
+      PERIOD:        {dtype: int,    format: "YYYYMM"}
+      SALES_QTY:     {dtype: float,  uom: EA,  nullable: true}
+      FCST_L1:       {dtype: float,  uom: EA,  nullable: true}
+      FCST_L2:       {dtype: float,  uom: EA,  nullable: true}
+      FCST_L3:       {dtype: float,  uom: EA,  nullable: true}
+      PROD_QTY:      {dtype: float,  uom: EA}
+      STOCK_CLOSE:   {dtype: float,  uom: EA}
+      SCHED_ADH_PCT: {dtype: float,  note: "0-100"}
+      YIELD_PCT:     {dtype: float,  note: "0-100"}
+      PROMO_FLAG:    {dtype: int,    values: [0, 1]}
+      CURRENCY:      {dtype: string, constant: EUR}
+
+  system_b:
+    file: data/raw/plant_system_B.csv
+    covers: [PLANT3]
+    grain: [item_no, site, month_end]
+    note: "Unmigrated acquisition. Own coding, own conventions."
+    columns:
+      item_no:        {dtype: string}
+      site:           {dtype: string}
+      month_end:      {dtype: string, format: "DD/MM/YYYY"}
+      shipped:        {dtype: float,  uom: CS, nullable: true}
+      fcst_m1:        {dtype: float,  uom: CS, nullable: true}
+      fcst_m2:        {dtype: float,  uom: CS, nullable: true}
+      fcst_m3:        {dtype: float,  uom: CS, nullable: true}
+      produced:       {dtype: float,  uom: CS}
+      stock_eom:      {dtype: float,  uom: CS}
+      adherence:      {dtype: float,  note: "0-1, NOT 0-100"}
+      yield_rate:     {dtype: float,  note: "0-1, NOT 0-100"}
+      promo:          {dtype: string, values: ["Y", "N", ""]}
+      ccy:            {dtype: string, constant: GBP}
+
+  known_defects:
+    - duplicate_sku_codes:  "source_sku_code collides across A and B for different materials"
+    - mixed_uom:            "A in EA, B in CS; case_size varies by SKU"
+    - mixed_currency:       "B reports GBP; convert at assumptions.fx.gbp_eur"
+    - mixed_date_format:    "A = YYYYMM int, B = DD/MM/YYYY string"
+    - null_volume:          "~4% nulls in SALES_QTY / shipped"
+    - scale_mismatch:       "adherence and yield 0-1 in B, 0-100 in A"
+    - free_text_category:   "inconsistent casing / trailing whitespace"
+
+# ---------------------------------------------------------------------------
+# CANONICAL LAYER — post-clean. This is the contract src/ and app.py rely on.
+# ---------------------------------------------------------------------------
+canonical:
+
+  sku_master:
+    grain: [sku_id]
+    columns:
+      sku_id:           {dtype: string, note: "surrogate key: {source_system}-{source_sku_code}"}
+      source_system:    {dtype: category, values: [A, B]}
+      source_sku_code:  {dtype: string}
+      description:      {dtype: string}
+      category:         {dtype: category, cardinality: 3}
+      abc_class:        {dtype: category, values: [A, B, C]}
+      plant_id:         {dtype: category, values: [PLANT1, PLANT2, PLANT3]}
+      line_id:          {dtype: category, values: [L1, L2, L3, L4]}
+      case_size:        {dtype: int}
+      price_eur:        {dtype: float}
+      std_cost_eur:     {dtype: float}
+      gross_margin_eur: {dtype: float, derived: "price_eur - std_cost_eur"}
+      shelf_life_days:  {dtype: int}
+      moq_units:        {dtype: float}
+      min_run_units:    {dtype: float}
+
+  line_master:
+    grain: [line_id]
+    note: "Confounders live here — required so the cost model has something to
+           learn against other than the disruption signal itself (see §9)."
+    columns:
+      line_id:              {dtype: category}
+      plant_id:             {dtype: category}
+      source_system:        {dtype: category}
+      units_per_hour:       {dtype: float}
+      hours_available_month:{dtype: float}
+      changeover_hours:     {dtype: float, note: "hours, NOT minutes — must match assumptions.yaml"}
+      equipment_age_years:  {dtype: float}
+      complexity_index:     {dtype: float, note: "SKU count / format variety on line"}
+      labour_rate_eur_hr:   {dtype: float}
+
+  clean_master:
+    file: data/clean/clean_master.parquet
+    grain: [sku_id, month]
+    rows_expected: 2160        # 60 SKUs x 36 months
+    columns:
+      sku_id:           {dtype: string}
+      month:            {dtype: date, format: "YYYY-MM-01", note: "period start"}
+      actual_units:     {dtype: float, nullable: false, note: "nulls imputed at clean; see cleaning spec"}
+      actual_imputed:   {dtype: bool,  note: "provenance flag — never silently fill"}
+      forecast_l1_units:{dtype: float, nullable: true}
+      forecast_l2_units:{dtype: float, nullable: true}
+      forecast_l3_units:{dtype: float, nullable: true}
+      production_units: {dtype: float}
+      stock_close_units:{dtype: float}
+      stock_open_units: {dtype: float, derived: "prior month stock_close_units"}
+      sched_adherence:  {dtype: float, range: [0, 1]}
+      yield_rate:       {dtype: float, range: [0, 1]}
+      promo_flag:       {dtype: bool}
+
+# ---------------------------------------------------------------------------
+# VALIDATION — schema validation must fail loudly, not coerce silently (§7).
+# ---------------------------------------------------------------------------
+validation:
+  on_unexpected_column: raise
+  on_missing_column: raise
+  on_dtype_mismatch: raise
+  key_uniqueness:
+    - {table: canonical.sku_master, keys: [sku_id]}
+    - {table: canonical.clean_master, keys: [sku_id, month]}
+  referential_integrity:
+    - {child: canonical.clean_master.sku_id, parent: canonical.sku_master.sku_id}
+    - {child: canonical.sku_master.line_id,  parent: canonical.line_master.line_id}
+  business_rules:
+    - non_negative: [actual_units, production_units, stock_close_units]
+    - stock_rollforward: "stock_open + production - actual == stock_close (tolerance 0.5 units)"
+    - completeness: "every sku_id has exactly history_months rows, no calendar gaps"
+    - capacity_feasible: "sum(production_units / units_per_hour) by line-month <= hours_available_month"
+  reconciliation_report:
+    emit: [rows_in_by_source, rows_dropped_by_reason, rows_out, null_rate_by_column,
+           fx_applied, uom_converted_rows, sku_collisions_resolved]
