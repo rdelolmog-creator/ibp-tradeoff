@@ -124,7 +124,7 @@ canonical:
       plant_id:             {dtype: category}
       source_system:        {dtype: category}
       units_per_hour:       {dtype: float}
-      hours_available_month:{dtype: float}
+      hours_available_month: {dtype: float}
       changeover_hours:     {dtype: float, note: "hours, NOT minutes — must match assumptions.yaml"}
       equipment_age_years:  {dtype: float}
       complexity_index:     {dtype: float, note: "SKU count / format variety on line"}
@@ -139,11 +139,11 @@ canonical:
       month:            {dtype: date, format: "YYYY-MM-01", note: "period start"}
       actual_units:     {dtype: float, nullable: false, note: "nulls imputed at clean; see cleaning spec"}
       actual_imputed:   {dtype: bool,  note: "provenance flag — never silently fill"}
-      forecast_l1_units:{dtype: float, nullable: true}
-      forecast_l2_units:{dtype: float, nullable: true}
-      forecast_l3_units:{dtype: float, nullable: true}
+      forecast_l1_units: {dtype: float, nullable: true}
+      forecast_l2_units: {dtype: float, nullable: true}
+      forecast_l3_units: {dtype: float, nullable: true}
       production_units: {dtype: float}
-      stock_close_units:{dtype: float}
+      stock_close_units: {dtype: float}
       stock_open_units: {dtype: float, derived: "prior month stock_close_units"}
       sched_adherence:  {dtype: float, range: [0, 1]}
       yield_rate:       {dtype: float, range: [0, 1]}
