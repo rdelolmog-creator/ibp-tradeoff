@@ -46,6 +46,7 @@ categories:
 
   ambient:
     seasonality_amplitude: 0.15      # +/- vs deseasonalised baseline | medium
+    seasonality_phase_months: 0
     annual_trend: 0.005              # medium
     promo_events_per_sku_year: 6     # medium
     promo_uplift_multiplier: 1.6     # medium
@@ -62,6 +63,7 @@ categories:
 
   chilled:
     seasonality_amplitude: 0.20
+    seasonality_phase_months: 4
     annual_trend: 0.02
     promo_events_per_sku_year: 5
     promo_uplift_multiplier: 1.4
@@ -78,6 +80,7 @@ categories:
 
   personal_care:
     seasonality_amplitude: 0.10
+    seasonality_phase_months: 8
     annual_trend: 0.02
     promo_events_per_sku_year: 7
     promo_uplift_multiplier: 1.7
@@ -171,6 +174,7 @@ plant_economics:
   schedule_adherence: 0.92                # range 0.85-0.96 | medium
   overtime_step_hours: 40                 # overtime bought in blocks, not
                                           # continuously — creates a step cost
+  max_overtime_hours_month: 80
 
 # ---------------------------------------------------------------------------
 # LEVERS — the four decision points. Defaults above; slider ranges here.
