@@ -120,6 +120,9 @@ Building a fix now (dynamic, capacity-aware allocation, and/or multi-line SKU as
 
 Decision: deferred, not skipped. Revisit immediately after Step 6, once the engine runs across all four lines and all four levers together — that is the first point real evidence exists (does any line breach capacity under realistic lever settings, or does the current static allocation hold up fine in practice). Committed: this gets a dedicated, unhurried review pass at that point, not a quick call folded into the next task.
 
+D-027 · Step 4 formally signed off DECISION: Step 4 (ingestion + cleaning) is approved by the human reviewer against the full-detail Step4_Data_Quality_Review.xlsx (9 tabs: full clean dataset, full null-recovery detail, full System B conversion detail, full SKU master detail with FX rate shown, corrections ledger, individually-listed dropped rows, full DQ report, known limitations). All 18 regression and robustness tests pass. clean_master.parquet for both data_primary and data_control is the approved input to Step 5.
+
 
 Step 5 — Demand characterisation
 (pending)
+
