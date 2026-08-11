@@ -29,6 +29,18 @@ D-012 · Capacity calibration DECISION: baseline line utilisation is 85% and lin
 
 
 Closed — rulings made
+Ref
+Question
+Ruling
+O-01
+Surrogate key vs. remapping table
+Surrogate key {system}-{code}. Simpler, and collisions are resolved once at ingest.
+O-02
+Confounders: data or config?
+line_master (data). Equipment age, complexity and line speed must be learnable features for the cost model, not fixed config.
+O-03
+Economic parameter set
+Ranges sourced from a GPT prompted for EMEA FMCG plausibility, corrected here, recorded in assumptions.yaml with confidence labels carried through to the limitations slide. No parameter is claimed as fact.
 
 
 
@@ -44,9 +56,51 @@ D-015 · Bias must be estimated in log space DECISION: Step 5 estimates chronic 
 D-016 · Ground truth carries raw-layer keys DECISION: ground_truth.csv carries source_system, source_sku_code and surrogate_sku_id alongside the internal sku_id, because the internal id appears in no raw file by design, and a truth file that cannot be joined cannot score the decomposition it exists to validate. The raw CSVs remain free of the internal id.
 
 D-017 · Two datasets, not one tuned dataset DECISION: bias recovery is validated against two generated datasets — the primary at ~6.2% censoring and a control at ~1.6% — rather than tuning assumptions.yaml until recovery looks clean, because parameter selection until the answer appears is the circularity failure in another costume (§9). The control varies abc.*.target_cover_weeks only (12/12/14 vs 4/4/6); demand_noise_cv was deliberately left untouched because it drives both censoring and the variance asymmetry, and changing it would confound the two effects the control exists to separate.
+
+D-018 · Constant-column drift check added DECISION: DataIngestor._validate_columns now asserts that any raw column the schema declares constant (e.g. system_b.ccy = GBP) actually holds only that value, because a value change that still parses as a valid string (GBP → USD) previously passed C-02 silently — the FX/UoM logic branches on the declared constant, not on what the column contains, so drift would have applied the wrong rate without raising anything. Verified: real data still passes; a simulated ccy drift is caught and raises SchemaViolation.
 Open at Step 1 close
+Ref
+Question
+Status
+O-04
+Realised line utilisation is 0.678 vs a 0.85 target, L1 lowest at 0.561. Recalibrate line_speed_units_hr or target_annual_net_sales_eur?
+Deferred until after the Step 6 MVD gate — recalibrating now forces a full downstream re-run for a number that gates nothing yet.
+O-05
+Which censored estimator at Step 5 — Tobit-style, or reconstruct latent demand from stockout periods?
+Ruled: Tobit-style censored regression, to preserve the circularity boundary — reconstructing latent demand via the forecast risks the forecast leaking into the demand estimate.
 
 
 
 Step 2 — Raw data + defect injection
+Ran via generate_data.py against both assumptions.yaml (primary) and assumptions_lowcensoring.yaml (control). Validation passed on both: net sales €196.9m / €199.2m vs €200m target, conversion cost 12.7% / 12.4% of COGS, roll-forward ties to zero, MAPE inside range on all three ABC classes. Censoring confirmed at 6.16% (primary) vs 1.57% (control), isolating the intended variable.
+
+
+Step 3 — Cleaning specification
+cleaning-spec.md written before any cleaning code, per the rubric's reasoning-before-code criterion. 13 numbered steps (C-01 to C-13), dependency-ordered, each with a stated failure condition. Verified against real data: identifier dtype coercion drops the ground-truth join from 60/60 to 42/60 if not forced to string; null volumes are 100% exactly recoverable via the stock roll-forward identity on all 1,511 checkable rows.
+
+
+Step 4 — Ingestion + cleaning
+src/ingest.py (DataIngestor) and src/cleaner.py (DataCleaner) implement the spec. Run identically against both datasets with zero code changes — the reusable-pipeline evidence: 2,159 rows out, 60 SKUs, 86 of 87 nulls recovered exactly, 1 row dropped (irrecoverable first-month null), roll-forward max error 0.000007 units, both datasets.
+
+D-019 · Human-review workbook is a pipeline output, not a reconstruction DECISION: Step4_Data_Quality_Review.xlsx is built by src/report_step4.py, called from inside the notebook immediately after DataCleaner.clean(), from the live df_clean/master/dq_report/dropped objects of that run — not rebuilt afterward from pasted console output — because the review artefact must be evidence of what the pipeline actually did, and a human sign-off (Approved / Approved with comments / Rejected) is required on this workbook before Step 5 proceeds.
+
+D-020 · Regression and robustness test suite added DECISION: tests/test_pipeline.py (14 tests) locks in the current correct output (row counts, recovery counts, roll-forward tolerance) as regression tests, and separately proves the pipeline fails loudly rather than silently on defect types the spec never anticipated (new column, missing column, constant-value drift, unparseable date, out-of-range rate, null-rate spike, invalid case size, unknown category) — because a pipeline claimed as reusable needs a runnable yes/no answer to "does this still work," not a manual re-read of console output each cycle.
+Open at Step 4 close
+Ref
+Question
+Status
+O-06
+sched_adherence and yield_rate are constant within source/category — a zero-variance feature teaches the Step 7 cost model nothing.
+Open, revisit at Step 7 if the model needs it.
+O-07
+Opening inventory value exists in generator internal state but is not exported — none of the four economic outputs currently need it.
+Open, not built. Revisit only if Step 8 reporting needs an average-position metric.
+O-08
+Pipeline handles one static 36-month load only. Rolling window mechanics, master data drift (SKU launch/delist), and re-clean scope on a second cycle are undefined.
+Deliberately deferred — does not block Step 5, since Step 5 consumes whatever clean_master.parquet currently holds. Must be resolved before the tool is claimed as a recurring IBP-cycle pipeline. Revisit after Step 6 MVD confirms what a second cycle would actually need to feed.
+
+
+
+Step 5 — Demand characterisation
 (pending)
+
