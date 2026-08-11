@@ -11,7 +11,7 @@ D-003 · Clean master grain DECISION: clean_master is (sku_id, month) with forec
 
 D-004 · Imputation provenance DECISION: every imputed value carries a boolean provenance flag (actual_imputed), because ~4% of volume arrives null, and unflagged imputation would let generator noise be attributed to a named planner role — silently breaking the accountability claim the tool exists to make.
 
-D-005 · Scalability answer (§11) DECISION: the first thing to break under volume is per-SKU scenario computation, not model training, because scenarios are evaluated combinatorially across levers while the cost model trains once. Mitigations: vectorisation, caching of unchanged legs, parallel scenario evaluation.
+D-005 · Scalability answer (§11, revised after testing — see D-021) DECISION: the original Step 0 claim ("scenario computation breaks first, not model training") was an untested guess. Tested by doubling schema.meta.scope.skus to 120 with unchanged lines/plants: src/ingest.py and src/cleaner.py scale linearly with zero code changes (0.13s, 4,318 rows, same ~99% null-recovery rate, roll-forward still ties to the same tolerance) — the cleaning pipeline genuinely doesn't care about volume. What breaks first is upstream of cleaning: generate_data.py's fixed SKU-to-line allocation pushes L3 utilisation to 1.149 (over 100% of physical capacity) because SKU count doubled while line count did not. The real scalability constraint is physical capacity and portfolio-to-line allocation, not compute cost.
 
 D-006 · PII answer (§11) DECISION: data is fully synthetic and accountability is assigned at role level, not to named individuals, because the framework's output is an attribution of chronic bias — and attributing that to a person rather than a role turns a diagnostic tool into a performance-management weapon.
 
@@ -63,8 +63,8 @@ Ref
 Question
 Status
 O-04
-Realised line utilisation is 0.678 vs a 0.85 target, L1 lowest at 0.561. Recalibrate line_speed_units_hr or target_annual_net_sales_eur?
-Deferred until after the Step 6 MVD gate — recalibrating now forces a full downstream re-run for a number that gates nothing yet.
+Realised line utilisation is 0.678 vs a 0.85 target. Merged into O-10.
+Superseded — see O-10.
 O-05
 Which censored estimator at Step 5 — Tobit-style, or reconstruct latent demand from stockout periods?
 Ruled: Tobit-style censored regression, to preserve the circularity boundary — reconstructing latent demand via the forecast risks the forecast leaking into the demand estimate.
@@ -85,6 +85,18 @@ src/ingest.py (DataIngestor) and src/cleaner.py (DataCleaner) implement the spec
 D-019 · Human-review workbook is a pipeline output, not a reconstruction DECISION: Step4_Data_Quality_Review.xlsx is built by src/report_step4.py, called from inside the notebook immediately after DataCleaner.clean(), from the live df_clean/master/dq_report/dropped objects of that run — not rebuilt afterward from pasted console output — because the review artefact must be evidence of what the pipeline actually did, and a human sign-off (Approved / Approved with comments / Rejected) is required on this workbook before Step 5 proceeds.
 
 D-020 · Regression and robustness test suite added DECISION: tests/test_pipeline.py (14 tests) locks in the current correct output (row counts, recovery counts, roll-forward tolerance) as regression tests, and separately proves the pipeline fails loudly rather than silently on defect types the spec never anticipated (new column, missing column, constant-value drift, unparseable date, out-of-range rate, null-rate spike, invalid case size, unknown category) — because a pipeline claimed as reusable needs a runnable yes/no answer to "does this still work," not a manual re-read of console output each cycle.
+
+D-021 · Scalability stress-tested, not asserted DECISION: ran the actual pipeline at 2× SKU count (120) and 37-month history (up from 36) as concrete stress tests, rather than answering the §11 scalability question from first principles, because a Mastery-level claim about what breaks under volume should be demonstrated against real code, not guessed at Step 0 before any code existed. Findings: (1) src/ingest.py/src/cleaner.py scale linearly with no code change — this is genuinely a non-issue at any realistic scope for this project; (2) doubling SKUs without adding plants/lines overloads line capacity (L3 hit 114.9% utilisation) because build_portfolio() splits SKUs evenly across whatever lines are configured, with no capacity-aware allocation; (3) a longer history window (37 months) works unchanged because schema.meta.history_months is read from config, not hard-coded — confirming the full-re-extraction pattern in D-022 requires no code change for a growing window. Supersedes the untested D-005 claim.
+
+D-022 · O-08 resolved: full re-extraction, not incremental append DECISION: the pipeline assumes full rolling-window re-extraction each IBP cycle (source systems re-queried for the entire window, not just the new month), not incremental append, because at this scale (2,160-4,318 rows tested) the efficiency gain from incremental is negligible while the correctness cost is real. Tested directly: simulating an incremental load (only the newest month passed to DataCleaner) breaks _derive_stock_open() — with no prior context, shift(1) returns null for every row in the new month, and C-11 would wrongly drop the entire month as irrecoverable. Full re-extraction also re-validates already-clean months every cycle, which incremental cannot do, so a source-system restatement of a prior period is caught rather than silently missed. schema.meta.history_months already reads from config, so a growing or shifting window requires no code change under this model — verified in D-021.
+
+D-023 · Recovery correctness fixed for multi-field nulls DECISION: a row is only counted as actual_imputed = True if the roll-forward formula's result is itself non-null, not merely if stock_open is present, because the prior check let a row with a second missing input (e.g. stock_close also null the same month) be flagged as successfully recovered before being caught and dropped a few lines later — overstating nulls_recovered_by_identity in the DQ report even though no bad data reached clean_master. Verified with a double-null test case: recovered count stays at 86, the row is correctly dropped instead.
+
+D-024 · Cascade failures classified separately from genuine first-month gaps DECISION: rows dropped at C-11 are split by calendar position — a genuine first month of a SKU's history vs. a later month whose stock_open is null because a prior month's stock_close was null and the gap cascaded forward via the roll-forward shift — because both cases share stock_open_units.isna() and an earlier version of this classification used exactly that check, silently mislabeling a real upstream data problem as an expected edge case. Fixed to use calendar position (is this the SKU's minimum month in the dataset) instead. Every dropped row's sku_id and month is now recorded individually (not just an aggregate count), and the Step 4 review workbook (sheet 7) flags cascade rows for investigation, separately from expected edge cases.
+
+D-025 · FX rate made an explicit, auditable field DECISION: fx_rate_applied is added as a column on the cleaned sku_master output (the applied gbp_eur rate for System B rows, null for System A), because the review workbook could previously show the converted price but not the rate that produced it — a reviewer had to cross-reference assumptions.yaml by hand to verify the FX math. Now shown directly alongside the converted values on sheet 5.
+
+D-026 · Review workbook rebuilt to show full detail, not samples DECISION: the Step 4 review workbook was rebuilt from 6 tabs sampling 2 SKUs to 9 tabs showing every row that was actually touched by cleaning — the full clean dataset (all 2,159 rows), every one of the 86 null recoveries with the roll-forward arithmetic shown, all 540 System B conversion rows, and all 60 SKU master rows — because a reviewer cannot approve what they cannot see, and 2 sample SKUs is a demonstration, not a review artefact.
 Open at Step 4 close
 Ref
 Question
@@ -95,12 +107,19 @@ Open, revisit at Step 7 if the model needs it.
 O-07
 Opening inventory value exists in generator internal state but is not exported — none of the four economic outputs currently need it.
 Open, not built. Revisit only if Step 8 reporting needs an average-position metric.
-O-08
-Pipeline handles one static 36-month load only. Rolling window mechanics, master data drift (SKU launch/delist), and re-clean scope on a second cycle are undefined.
-Deliberately deferred — does not block Step 5, since Step 5 consumes whatever clean_master.parquet currently holds. Must be resolved before the tool is claimed as a recurring IBP-cycle pipeline. Revisit after Step 6 MVD confirms what a second cycle would actually need to feed.
+O-09
+Doubling SKU count without adding lines overloads capacity. Merged into O-10.
+Superseded — see O-10.
 
+
+O-10 · SKU-to-line allocation is static and capacity-blind (merges O-04, O-09, and the multi-line question raised at Step 4 review)
+
+Three symptoms, one root cause: build_portfolio() assigns each SKU to exactly one line, split evenly by count, with no regard for capacity, line speed, or cost. This produces: (a) realised utilisation of 0.678 vs an 0.85 target — the even split ignores real line-speed differences; (b) L3 hitting 114.9% utilisation when SKU count is doubled without adding lines (D-021); (c) no mechanism for a single SKU to be produced across two lines/plants, which becomes more likely exactly when simulating category growth within ambient/chilled/personal_care.
+
+Building a fix now (dynamic, capacity-aware allocation, and/or multi-line SKU assignment) would change clean_master's grain from (sku_id, month) to (sku_id, line_id, month) — reopening Steps 1-4, which are signed off, for a problem the Step 6 MVD gate cannot even test (the MVD is deliberately scoped to one line in isolation, per §5, so it will never surface cross-line capacity pressure either way).
+
+Decision: deferred, not skipped. Revisit immediately after Step 6, once the engine runs across all four lines and all four levers together — that is the first point real evidence exists (does any line breach capacity under realistic lever settings, or does the current static allocation hold up fine in practice). Committed: this gets a dedicated, unhurried review pass at that point, not a quick call folded into the next task.
 
 
 Step 5 — Demand characterisation
 (pending)
-
