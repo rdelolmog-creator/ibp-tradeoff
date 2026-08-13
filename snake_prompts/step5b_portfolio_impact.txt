@@ -1,0 +1,76 @@
+SNAKE PROMPT — src/portfolio_impact.py (Step 5b)
+====================================================
+Written in this chat directly, NOT via the blind chat — this module does
+no estimation, only reporting on results the blind estimator (Step 5a)
+already produced. No hidden value exists to tune toward.
+
+------------------------------------------------------------------------
+S — SPECIFY
+------------------------------------------------------------------------
+Python module. Reads demand_characteristics.csv (Step 5a's output,
+unaltered) and joins it against canonical sku_master (category, plant,
+line, price — never seen by the blind estimator) to answer: where does
+low-confidence bias estimation concentrate, and how big is it in volume
+and revenue terms.
+
+------------------------------------------------------------------------
+N — NOTE THE ENVIRONMENT
+------------------------------------------------------------------------
+Google Colab, called from notebooks/step05b_scoring_and_portfolio_impact
+.ipynb, in a full clone of the repo (so config/, src/, sku_master all
+exist). pandas only.
+
+------------------------------------------------------------------------
+A — ACTION
+------------------------------------------------------------------------
+Generate src/portfolio_impact.py with two functions:
+
+  score_against_ground_truth(demand_characteristics, ground_truth)
+      -> pd.DataFrame
+    Joins on the surrogate key. Returns per-category encoded vs. recovered
+    bias, per-SKU correlation and MAE. This function is ONLY ever called
+    in this Project's own sandbox/Colab session, never given to or run by
+    the blind chat — ground_truth.csv must never leave this boundary.
+
+  concentration_report(demand_characteristics, sku_master, clean_master,
+                        flagged_sku_ids) -> dict
+    Takes the list of SKUs flagged as low-confidence (e.g. INCONCLUSIVE
+    in Step 5a's diagnostics) and reports, for that set vs. the rest:
+      - counts and share by source_system, plant_code, line_code,
+        category, abc_class
+      - annual volume share (from clean_master actual_units, averaged
+        across the historical window)
+      - annual revenue share (volume x price_eur from sku_master)
+    Must not assume any specific flagged-SKU list — takes it as an
+    argument, so this works whichever SKUs a given dataset's Step 5a run
+    flags, not just this run's particular 14.
+
+------------------------------------------------------------------------
+K — KEY DATA STRUCTURE
+------------------------------------------------------------------------
+demand_characteristics.csv: indexed by sku_id, columns
+irreducible_volatility_cv, chronic_bias_l1/l2/l3, random_error_cv_l1/l2/l3,
+n_censored_months, notes (Step 5a's fixed output contract).
+
+ground_truth.csv: surrogate_sku_id (join key), category,
+category_chronic_bias, sku_idiosyncratic_bias, total_base_chronic_bias.
+
+sku_master (canonical, from cleaner.py): sku_id, category, abc_class,
+plant_code, line_code, source_system, price_eur.
+
+clean_master (canonical): sku_id, month, actual_units.
+
+------------------------------------------------------------------------
+E — EXTRA DETAILS
+------------------------------------------------------------------------
+1. No hard-coded SKU IDs, category names, or thresholds — everything
+   derived from the data and arguments passed in.
+2. score_against_ground_truth must never be imported into or called from
+   any notebook or script handed to the blind chat.
+3. concentration_report's flagged_sku_ids argument should typically come
+   from parsing Step 5a's own verdict output (e.g. its INCONCLUSIVE list),
+   not be re-derived independently — this module reports on Step 5a's
+   findings, it does not second-guess them.
+4. Return plain dicts/DataFrames, not formatted text — presentation
+   (tables, charts, PDF) is a separate concern, built in the calling
+   notebook or elsewhere, not in this module.
