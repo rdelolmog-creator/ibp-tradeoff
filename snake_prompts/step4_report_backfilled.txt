@@ -1,0 +1,65 @@
+SNAKE PROMPT — src/report_step4.py (backfilled for the record)
+==================================================================
+This module was originally built directly in this chat, iteratively, in
+response to a human-review requirement raised mid-Step-4. No SNAKE prompt
+was recorded at the time. This is a backfilled reconstruction of what that
+prompt should have been, for documentation completeness.
+
+------------------------------------------------------------------------
+S — SPECIFY
+------------------------------------------------------------------------
+Python module, no file input of its own — takes in-memory objects produced
+by an already-completed DataIngestor.load() + DataCleaner.clean() run in
+the SAME pipeline execution. Produces one Excel workbook as a human-review
+and sign-off artefact for Step 4.
+
+------------------------------------------------------------------------
+N — NOTE THE ENVIRONMENT
+------------------------------------------------------------------------
+Google Colab, called from notebooks/step04_ingest_and_clean.ipynb
+immediately after cleaner.clean(raw). openpyxl. Must run against both
+data_primary and data_control with zero code changes.
+
+------------------------------------------------------------------------
+A — ACTION
+------------------------------------------------------------------------
+Generate src/report_step4.py, function build_review_workbook(raw, df_clean,
+master, dq_report, dropped, out_path, dataset_label) -> Path, producing a
+9-sheet workbook:
+  1. Review & Approval — summary, navigation, sign-off block (Reviewed by /
+     Date / Decision dropdown: Approved, Approved with comments, Rejected)
+  2. Full Clean Dataset — every row of df_clean, not sampled
+  3. Null Recovery — Full Detail — every row where actual_units was
+     derived, with the roll-forward arithmetic shown per row
+  4. System B Conversion — Full Detail — every System B row, raw vs.
+     converted, case_size and computed units shown
+  5. SKU Master — Full Detail — every SKU, raw vs. clean fields,
+     collision flag, fx_rate_applied shown per row
+  6. Corrections Applied — ledger by defect type with counts
+  7. Rows Dropped — every individual dropped row (sku_id, month, category,
+     reason), not just an aggregate count
+  8. Full DQ Report — every metric, high null-rates flagged
+  9. Known Limitations — read-before-approving list
+
+------------------------------------------------------------------------
+K — KEY DATA STRUCTURE
+------------------------------------------------------------------------
+Inputs are already-in-memory pandas objects from DataIngestor/DataCleaner:
+raw (dict of 3 DataFrames), df_clean (canonical.clean_master shape),
+master (canonical.sku_master shape), dq_report (metric/value pairs),
+dropped (list of {reason, rows, detail} dicts, detail = list of
+{sku_id, month}).
+
+------------------------------------------------------------------------
+E — EXTRA DETAILS
+------------------------------------------------------------------------
+1. Built from LIVE pipeline objects only — never reconstructed afterward
+   from pasted console output. The workbook is evidence of what a specific
+   pipeline run actually did.
+2. No sampling — every touched row shown, on the grounds that a reviewer
+   cannot approve what they cannot see.
+3. Sign-off must be a genuine gate: a separate downstream cell reads the
+   Decision cell programmatically (by label search, not a hard-coded cell
+   reference) and refuses to proceed if it is not "Approved" or "Approved
+   with comments."
+4. Sheet names ≤31 characters (Excel limit).
