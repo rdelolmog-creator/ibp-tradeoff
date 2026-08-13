@@ -1,0 +1,225 @@
+SNAKE PROMPT — STEP 6, MVD ENGINE
+IBP Trade-Off Engine · Week 6 Capstone · AI Finance Accelerator
+
+Written before the code, per project convention, so the submission carries the
+prompt as well as the artefact. Approved 2026-08-13 together with D-045 to
+D-050. Built against decisions D-035, D-038, D-040, D-041 and architecture §5
+and §9.
+
+
+-------------------------------------------------------------------------------
+S — SPECIFY FILE TYPE AND DATA SOURCE
+-------------------------------------------------------------------------------
+
+Python module src/engine.py, Colab notebook step06_mvd_engine.ipynb, and test
+module tests/test_engine.py.
+
+No new data is generated at this step. Inputs are existing pipeline artefacts:
+
+  <data_root>/clean/clean_master.parquet      (sku_id, month)   2,159 rows  Step 4
+  <data_root>/clean/sku_master.parquet        sku_id            60 rows     Step 4 (D-043)
+  demand_characteristics.csv                  sku_id            60 rows     Step 5a (blind)
+  censoring_diagnostics.csv                   sku_id            60 rows     Step 5a (blind)
+  config/assumptions.yaml                                                   Step 0
+  config/schema.yaml                                                        Step 0
+
+ground_truth.csv is NOT an input and must not be importable from src/engine.py.
+The engine estimates nothing, so the blind boundary of D-033 does not apply —
+but ground truth has no role in a forward simulation either, and a test asserts
+its absence.
+
+
+-------------------------------------------------------------------------------
+N — NOTE THE ENVIRONMENT
+-------------------------------------------------------------------------------
+
+Google Colab, repo cloned to /content/ibp-tradeoff. Step 6 sits inside the
+Colab block (steps 1-9 and 12); Streamlit Cloud + GitHub applies only at
+step 10.
+
+Dependencies limited to pandas, numpy, pyyaml. No scikit-learn and no xgboost:
+the learned cost model is Step 7, and Step 6 must stand on the deterministic
+causal calculation alone. No scipy either — the inverse normal CDF and the
+normal loss function are implemented locally rather than carrying a dependency
+into Streamlit Cloud for two functions.
+
+src/engine.py contains no Colab-specific calls (no google.colab, no
+files.download, no drive.mount), because app.py imports it unchanged at
+Step 10.
+
+
+-------------------------------------------------------------------------------
+A — ACTION TO PERFORM
+-------------------------------------------------------------------------------
+
+In src/engine.py:
+
+1. @dataclass(frozen=True) class LeverSettings
+   Four fields: service_target, inventory_cover_weeks, forecast_bias_correction,
+   min_run_hours. validate() checks each against assumptions.levers.*.range and
+   raises EngineViolation on breach. defaults() reads from assumptions.abc and
+   assumptions.categories — never literals in code. replace() returns a new
+   frozen instance for sweeps.
+
+2. def build_line_master(assumptions, schema) -> pd.DataFrame
+   Module-level function producing the canonical.line_master table that
+   schema.yaml declares but no pipeline step emits. Joins assumptions.lines
+   (plant, category, equipment_age_years, complexity_index) to
+   assumptions.categories.<cat> (line_speed_units_hr -> units_per_hour,
+   changeover_hours, changeover_cash_eur, yield_rate) and
+   assumptions.plant_economics (scheduled_hours_per_line_month ->
+   hours_available_month, labour_rate_eur_hr, schedule_adherence). Asserts its
+   own output satisfies the schema declaration.
+
+3. class TradeOffEngine
+
+   __init__(assumptions, schema, clean_master, sku_master,
+            demand_characteristics, flagged_sku_ids)
+       Validates referential integrity across the three frames and refuses to
+       start if any ground-truth column is present in demand_characteristics.
+
+   project_demand(line_id) -> DataFrame
+       One deterministic forward demand path per SKU over
+       schema.meta.horizon_months (D-041). Classical decomposition on observed
+       history alone: seasonal index by calendar month from the ratio to a
+       centred 12-month moving average; OLS trend on the deseasonalised series;
+       promo months excluded from level and trend so a promo calendar does not
+       masquerade as growth.
+       Reads NOTHING from assumptions.yaml. The generator's own seasonality
+       amplitude, phase and trend parameters live there, and using them would
+       hand the engine the answer the data is supposed to carry.
+       Takes no levers, and must not: demand is exogenous (§9).
+
+   project_plan(demand, levers) -> DataFrame
+       THE ONLY PLACE forecast_bias_correction ACTS. Plan = demand x
+       (1 + (1 - c) x detected_bias_pct). The uncorrected plan carries the
+       chronic bias Step 5a detected; the lever removes a share of it. Demand
+       is untouched, so every downstream cost moves only because the plan
+       quantity moved.
+       chronic_bias_l1 is in log units and is converted with np.expm1.
+       chronic_bias_pct_l1 is NOT read: it lives in the diagnostics file,
+       outside Step 5a's fixed nine-column contract.
+       SKUs in flagged_sku_ids receive zero correction whatever the lever says
+       (D-035), and the applied rate is written to the output so the rule is
+       auditable rather than implicit.
+
+   simulate(line_id, levers) -> (sku_month, line_month)
+       Monthly loop over the horizon.
+       Per SKU-month: order-up-to level = inventory_cover_weeks/4.33 x plan
+       + z(service_target) x irreducible_volatility_cv x plan. Requirement =
+       max(0, level - opening stock) + backlog, rounded up to the larger of
+       moq_units and min_run_hours x units_per_hour. FIFO ageing layers.
+       Per line-month: run hours, changeover count, workload against
+       hours_available_month, overtime bought in overtime_step_hours blocks
+       capped at max_overtime_hours_month, then a pro-rata run cut with the
+       remainder carried as backlog — the same remedy the generator applies, so
+       Step 7's cost model learns a consistent world.
+
+   economics(...) -> the four outputs, each traced to its assumptions key
+
+       Lost sales            expected shortfall from the standard normal loss
+                             function on irreducible_volatility_cv, x
+                             stockout_disposition.<cat>.lost, x gross_margin_eur
+       Excess / slow-moving  shelf-life write-off at std_cost_eur, PLUS a
+                             provision on stock beyond
+                             inventory_risk.excess_cover_months_threshold
+                             months of DEMAND (never of plan — D-048)
+       Conversion cost       fixed_absorption + run_hours x labour_rate +
+                             changeovers x changeover_cash_eur + overtime_hours
+                             x labour_rate x overtime_premium_pct
+       Working capital       closing stock at std_cost_eur x
+                             carrying_rate_monthly, applied once per simulated
+                             month so duration is captured by the loop itself
+
+   run_scenario(line_id, levers) -> ScenarioResult
+       Monthly frames, four totals, total_economic_cost_eur, service achieved,
+       utilisation, and an assumption fingerprint.
+
+   sweep(line_id, lever_name, values, base_levers) -> DataFrame
+       Three levers held, one moved. This is the MVD gate table.
+
+In tests/test_engine.py — 17 tests, of which the guardrail set matters most:
+
+   test_bias_lever_acts_only_through_quantities
+       THE test (§9). Sweeps forecast_bias_correction 0.0 -> 1.0 in 11 steps
+       with all else fixed, then rebuilds every cost from simulated quantities
+       at unit rates read before the sweep. If any cost can only be reproduced
+       by reference to the lever value, the model is circular and every number
+       it produces is an artefact of its own construction.
+   test_demand_is_never_a_function_of_any_lever
+       Demand path bit-identical across every lever setting.
+   test_ground_truth_is_not_importable
+   test_all_four_outputs_are_live
+   test_min_run_hours_moves_three_outputs_together     (D-040)
+   test_cover_lever_has_an_interior_optimum
+       The trade-off must actually trade off: neither slider end may be best.
+   test_capacity_never_breaches_available_plus_max_overtime
+   test_flagged_skus_receive_no_bias_correction        (D-035)
+   test_engine_runs_on_every_line_without_code_change
+   test_line_master_matches_schema
+   plus contract, invariant and reusability tests.
+
+The notebook imports from src/ and calls it. No logic in notebook cells.
+
+
+-------------------------------------------------------------------------------
+K — KEY DATA STRUCTURE
+-------------------------------------------------------------------------------
+
+sku_month — 15 SKUs x 12 months = 180 rows
+
+sku_id  month       demand_units  plan_units  detected_bias_pct  bias_correction_applied  safety_stock_units  target_stock_units  stock_open_units  production_units  run_hours  shipped_units  lost_units  writeoff_units  excess_units  stock_close_units  stock_value_eur  lost_sales_eur  excess_obsolescence_eur  working_capital_cost_eur
+A-05    2026-09-01  38104.2       42413.0     0.1131             0.0                      31184.5             70367.8             52310.0           0.0               0.0        38104.2        0.0         0.0             0.0           14205.8            37503.3          0.0             0.0                      281.3
+A-05    2026-10-01  36121.7       40206.7     0.1131             0.0                      29561.6             66692.8             14205.8           31500.0           9.0        36121.7        0.4         0.0             0.0           9584.1             25302.0          0.6             0.0                      189.8
+A-08    2026-09-01  51882.9       55960.3     0.0786             0.0                      27174.5             80047.1             61044.0           0.0               0.0        51882.9        0.0         0.0             0.0           9161.1             24185.3          0.0             0.0                      181.4
+A-08    2026-10-01  49182.4       53047.0     0.0786             0.0                      25760.3             75880.1             9161.1            31500.0           9.0        49182.4        1.2         0.0             0.0           -0.0               0.0              1.7             0.0                      0.0
+A-37    2026-09-01  92410.8       98065.5     0.0601             0.0                      12594.9             35174.6             41220.0           0.0               0.0        92410.8        0.0         0.0             0.0           0.0                0.0              0.0             0.0                      0.0
+
+line_month — 12 rows
+
+line_id  month       run_hours  changeover_count  changeover_hours  workload_hours  hours_available  overtime_hours  capacity_shortfall_units  utilisation  conversion_cost_eur
+L3       2026-09-01  57.5       5                 17.5              75.0            520.0            0.0             0.0                       0.144        310588.8
+L3       2026-10-01  58.5       5                 17.5              76.0            520.0            0.0             0.0                       0.146        310621.4
+L3       2026-11-01  93.8       6                 21.0              114.8           520.0            0.0             0.0                       0.221        313500.4
+L3       2026-12-01  112.3      6                 21.0              133.3           520.0            0.0             0.0                       0.256        314093.2
+L3       2027-01-01  170.7      11                38.5              209.2           520.0            0.0             0.0                       0.402        324711.9
+
+sweep — the gate table, one row per lever value
+
+lever_name      lever_value  lost_sales_eur  excess_obsolescence_eur  conversion_cost_eur  working_capital_cost_eur  total_economic_cost_eur  service_achieved  utilisation_mean
+min_run_hours   2.0          37689.9         254046.0                 3889835.4            163591.7                  4345163.0                0.997             0.369
+min_run_hours   5.0          35171.5         254046.0                 3867332.9            169798.2                  4326348.6                0.997             0.363
+min_run_hours   9.0          31039.7         261363.7                 3821205.3            187622.1                  4301230.9                0.997             0.353
+min_run_hours   14.0         29742.6         287588.0                 3794317.8            207223.2                  4318871.6                0.998             0.350
+min_run_hours   20.0         25296.1         559856.2                 3781263.6            245424.1                  4611840.0                0.998             0.358
+
+MAGNITUDES ARE NOT FINDINGS (§10). Every number above is whatever the generator
+and the assumption set encoded. The shape of the response is the deliverable;
+the level is not.
+
+
+-------------------------------------------------------------------------------
+E — EXTRA DETAILS
+-------------------------------------------------------------------------------
+
+- No hard-coded paths, SKU lists, line ids, category names or rates. line_id is
+  a runtime parameter, data_root is a parameter, every economic constant
+  resolves to a key in config/assumptions.yaml.
+- Must be importable by both step06_mvd_engine.ipynb and app.py with no
+  conditional import blocks and no Colab-only calls.
+- min_run_hours from LeverSettings overrides categories.<cat>.min_run_hours;
+  the config value is the slider default, not a constant.
+- Deterministic throughout. No RNG, no seeding, no sampling (D-041). Two runs
+  of the same scenario must be bit-identical.
+- Every returned frame carries an assumption fingerprint, so no output can be
+  shown without the assumption set that produced it.
+- Slow-moving cover is measured against demand, never against plan (D-048).
+- Flagged SKUs receive zero bias correction, and the applied rate is written to
+  the output frame so the rule is auditable (D-035).
+- Must run unchanged on data_control. Note that a full control demonstration
+  also requires Step 5a to be re-run on the control panel — the engine cannot
+  borrow the primary dataset's estimates, and the notebook says so rather than
+  reporting a green tick that means nothing.
+- Nothing is final until it has run in Colab and the numbers have been
+  confirmed by the reviewer's own run (D-037). Sandbox agreement is not
+  evidence.
