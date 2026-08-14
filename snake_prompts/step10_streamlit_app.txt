@@ -1,0 +1,269 @@
+SNAKE PROMPT — STEP 10, STREAMLIT APP
+IBP Trade-Off Engine · Week 6 Capstone · AI Finance Accelerator
+
+Scoped to exactly what §5 asks for — sliders, assumptions panel, four outputs
+— plus the two Step 9 artefacts that would be wasted if the app didn't surface
+them: the capacity warning (D-070) and the policy brief (D-071). Nothing else.
+No new mechanisms, no new economic logic. src/engine.py, src/reporter.py,
+src/policy_model.py, src/portfolio_sweep.py are CONSUMED, not modified.
+
+One environment decision this prompt has to settle, that no earlier step
+faced: Step 5a's output has been uploaded manually every Colab session. A
+deployed app has no upload step — it has to ship as a committed artefact. See
+D-072 below.
+
+
+-------------------------------------------------------------------------------
+S — SPECIFY FILE TYPE AND DATA SOURCE
+-------------------------------------------------------------------------------
+
+New:      src/app_logic.py, app.py, requirements.txt, tests/test_app_logic.py
+New data: app_data/demand_characteristics.csv, app_data/censoring_diagnostics.csv,
+          app_data/optimal_policy.csv, app_data/step08_portfolio_summary.csv,
+          app_data/step08_lever_consistency.csv
+Modified: none. src/engine.py, src/reporter.py, src/policy_model.py,
+          src/portfolio_sweep.py are consumed unchanged.
+
+D-072 — why app_data/ exists and what it commits to:
+  Step 5a's demand_characteristics.csv and censoring_diagnostics.csv have been
+  uploaded by hand into every Colab notebook so far. A Streamlit Cloud app has
+  no interactive upload step at cold start, so these become COMMITTED
+  artefacts under app_data/ — the same approved Step 5a output, relocated, not
+  regenerated and not reopening the blind boundary (the estimator already ran
+  once, blind; committing its output is not re-running it).
+
+  optimal_policy.csv, step08_portfolio_summary.csv and
+  step08_lever_consistency.csv are ALSO committed rather than recomputed at
+  app startup — a full 1,024-scenario sweep (~65s) on every Streamlit Cloud
+  cold start is not acceptable latency, and is unnecessary: these are
+  reference tables, not live computation. clean_master.parquet and
+  sku_master.parquet are the EXCEPTION — regenerated live via
+  generate_data.py + DataCleaner at startup (same code Steps 4/6/7/8 use, and
+  fast: seconds), because they are the one artefact cheap enough to derive on
+  demand and doing so keeps the reusability claim (D-055's spirit) intact for
+  at least this part of the pipeline.
+
+  The risk of committing static Step 7/8 artefacts: they can go stale if
+  assumptions.yaml changes after they were generated. Mitigated by a
+  fingerprint check (see Action, fingerprint_status) that WARNS rather than
+  silently trusting mismatched data — never blocks the app, since a stale
+  reference table is still better than no table, but the person using it must
+  see the mismatch.
+
+
+-------------------------------------------------------------------------------
+N — NOTE THE ENVIRONMENT
+-------------------------------------------------------------------------------
+
+Streamlit Cloud, NOT Colab. Deployed from GitHub; app.py runs continuously as
+a server, not cell by cell. Because it imports the same src/ modules already
+validated in Colab, it should be thin — mostly layout and sliders.
+
+requirements.txt matters here in a way it hasn't in any prior step — Colab
+pre-installs pandas; Streamlit Cloud installs only what is listed. Must
+include at minimum: streamlit, pandas, numpy, pyyaml, pyarrow (for
+.parquet — Colab has this pre-installed too, but it is easy to forget it is
+not automatic elsewhere).
+
+All logic lives in src/app_logic.py, which contains NO `import streamlit` and
+NO Colab-specific calls, so it is independently testable with pytest exactly
+like every other src/ module. app.py imports app_logic and calls st.* only for
+layout — it should be short enough to read top to bottom in one sitting.
+
+Caching: app_logic exposes plain functions; app.py wraps the expensive ones
+(pipeline rebuild, engine construction) with @st.cache_resource so they run
+once per server process, not once per slider movement. A single
+run_scenario() call is ~63ms (measured, Step 8) — cheap enough to run live on
+every slider change with no caching needed there.
+
+
+-------------------------------------------------------------------------------
+A — ACTION TO PERFORM
+-------------------------------------------------------------------------------
+
+In src/app_logic.py:
+
+  def load_config(repo_root) -> tuple[dict, dict]
+      assumptions.yaml + schema.yaml. No caching here — trivial cost, and
+      caching config risks serving stale config after a git-triggered
+      redeploy.
+
+  def build_clean_data(repo_root) -> tuple[pd.DataFrame, pd.DataFrame]
+      Regenerates clean_master and sku_master via the SAME
+      DataIngestor/DataCleaner path Steps 4/6/7/8 use — no duplicated cleaning
+      logic. If data_primary/raw does not exist, run generate_data.py first
+      (same as every prior notebook). Deterministic (seeded), so this is safe
+      to do at every cold start.
+
+  def load_app_data(repo_root) -> dict
+      Loads the five committed app_data/ files. Raises with a clear message
+      naming the missing file if any is absent — same contract as
+      src/reporter.require_artefact, reused rather than reimplemented.
+
+  def build_engine(assumptions, schema, clean_master, sku_master, app_data) -> TradeOffEngine
+      Constructs TradeOffEngine from committed + regenerated inputs. Flagged
+      SKUs come from app_data's censoring_diagnostics via
+      src.portfolio_impact.get_flagged_skus — the same function every
+      notebook uses, not a reimplementation.
+
+  def fingerprint_status(engine, app_data) -> dict
+      Compares engine.assumption_fingerprint against the fingerprint recorded
+      in app_data['optimal_policy'] (and the Step 8 tables). Returns
+      {'match': bool, 'live': str, 'static': str}. The app WARNS on mismatch,
+      never blocks — see D-072.
+
+  def scenario_view(engine, line_id, levers, assumptions, schema) -> dict
+      Calls engine.run_scenario(...) then src.reporter.avoidable_cost_view(...)
+      — does NOT recompute anything reporter.py or engine.py already do. This
+      function only assembles inputs and forwards the call, so a test can
+      assert it never duplicates economic logic (same guardrail pattern as
+      test_reporter_does_not_recompute_engine_outputs in Step 9).
+
+  def capacity_check(line_id, cover_weeks, portfolio_summary_df) -> Optional[str]
+      Thin wrapper around src.reporter.capacity_warning — looks up the line's
+      row and forwards. Not a reimplementation.
+
+  def owner_table(avoidable_view, assumptions) -> pd.DataFrame
+      Thin wrapper around src.reporter.owner_view.
+
+  def top_policy_moves(optimal_policy_df, sku_master, top_n=10) -> pd.DataFrame
+      Thin wrapper around src.reporter.policy_brief, with the default-lever
+      lookup built from assumptions.abc (same construction Step 9's notebook
+      uses).
+
+In app.py:
+
+  Page config, then three sections:
+
+  1. SIDEBAR — line selector (from engine.line_master, not hard-coded) and
+     four sliders bound to assumptions.levers.*.range (never hard-coded
+     min/max). Defaults come from LeverSettings.defaults() for the selected
+     line's category, ABC class A (same convention as every gate/sweep run).
+
+  2. ASSUMPTIONS PANEL — on the MAIN screen, not buried in an expander users
+     will not open (architecture §9 risk mitigation table: "assumptions panel
+     on the main app screen, not buried"). Shows: the selected line's
+     category, plant economics in effect, ABC-class defaults, and the
+     fingerprint_status warning if live and static fingerprints disagree.
+
+  3. RESULTS — scenario_view() output as four st.metric() cards (avoidable
+     figures), with conversion_cost_fixed_eur shown as a fifth, visually
+     distinct card labelled "fixed absorption — no lever moves this", so
+     total_reported_cost_eur is always reconcilable on screen, never only the
+     avoidable figure (D-062's exact requirement). capacity_check() result
+     shown as st.warning if not None. owner_table() shown as a small reference
+     table. A "Portfolio evidence" section below (or a second tab) shows
+     top_policy_moves() and the Step 8 lever-consistency table as static
+     reference, clearly labelled with the DATE/fingerprint they were generated
+     under (D-072's mitigation for staleness).
+
+  No inline economic logic in app.py. If a line of app.py computes a cost
+  rather than displaying one already computed by app_logic/reporter/engine,
+  that is a scope violation — the app is a thin client (per architecture
+  §4/§6, "notebooks are thin orchestration layers"; the app is the same
+  principle applied to Streamlit).
+
+In requirements.txt: streamlit, pandas, numpy, pyyaml, pyarrow — pinned to
+major versions compatible with what Colab has been using (pandas>=2, do not
+pin to an exact patch version that will conflict with Streamlit Cloud's
+resolver).
+
+TESTS — tests/test_app_logic.py:
+
+  test_no_streamlit_import_in_app_logic
+      "import streamlit" must not appear in src/app_logic.py — this is what
+      keeps the module testable without a Streamlit runtime.
+  test_build_clean_data_matches_step4_output
+      shape and key columns match what DataCleaner produces directly — proves
+      no divergent cleaning path was introduced.
+  test_load_app_data_raises_on_missing_file_naming_it
+  test_fingerprint_mismatch_is_detected
+      construct app_data with a deliberately wrong fingerprint, assert
+      match=False and both values are surfaced, not swallowed.
+  test_scenario_view_does_not_reimplement_economics
+      inspect that app_logic.py's scenario_view calls engine.run_scenario and
+      reporter.avoidable_cost_view rather than containing arithmetic on
+      lost_units, stock_close_units, etc. — same style of check as Step 9's
+      recompute guardrail.
+  test_capacity_check_and_owner_table_are_thin_wrappers
+      assert their outputs are identical to calling
+      reporter.capacity_warning / reporter.owner_view directly with the same
+      inputs — proves no divergence between the app path and the notebook
+      path.
+  test_sliders_would_be_bound_by_assumptions_not_hardcoded
+      cannot literally test Streamlit widgets without a runtime, so this
+      inspects app.py's source for the literal range values (e.g. searches
+      for any bare numeric slider bound not preceded by a reference to
+      assumptions['levers']) — a lightweight static guard against a
+      hard-coded slider creeping in during a rushed edit.
+  test_app_py_contains_no_inline_economic_arithmetic
+      static check: app.py's source must not contain the strings used to
+      compute any of the four outputs internally (e.g. "* gross_margin_eur",
+      "* carrying_rate_monthly") — if it does, logic leaked out of
+      app_logic/reporter into the UI layer.
+
+
+-------------------------------------------------------------------------------
+K — KEY DATA STRUCTURE
+-------------------------------------------------------------------------------
+
+scenario_view() return value — same shape as Step 9's avoidable_cost_view(),
+because it IS that function's output, forwarded:
+
+  {
+    "line_id": "L3",
+    "lost_sales_eur": 42014.05,
+    "excess_obsolescence_eur": 261363.70,
+    "working_capital_cost_eur": 184699.93,
+    "conversion_cost_avoidable_eur": 220954.45,
+    "conversion_cost_fixed_eur": 3600000.00,
+    "total_avoidable_cost_eur": 709032.13,
+    "total_reported_cost_eur": 4309032.13,
+    "assumption_fingerprint": "v0.1:..."
+  }
+
+fingerprint_status() return value:
+
+  {"match": True, "live": "v0.1:703d09b1e1a7", "static": "v0.1:703d09b1e1a7"}
+
+App layout, described not drawn:
+
+  SIDEBAR                    MAIN
+  ─────────                  ────────────────────────────────
+  Line: [L1 L2 L3 L4]        ASSUMPTIONS PANEL (always visible)
+  service_target    ──●──     category, plant economics, ABC defaults,
+  inventory_cover   ──●──     fingerprint match/mismatch warning
+  bias_correction   ──●──
+  min_run_hours     ──●──    RESULTS
+                              [Lost sales] [Excess] [Working cap] [Conv-avoidable]
+                              [Conversion — FIXED, no lever moves this]
+                              (capacity warning banner, if triggered)
+                              Owner table
+
+                              PORTFOLIO EVIDENCE (reference, dated)
+                              Top policy moves · Lever consistency table
+
+Illustrative shape only. MAGNITUDES ARE NOT FINDINGS (§10) — this step's job
+is correct, honest display of numbers already computed, not new numbers.
+
+
+-------------------------------------------------------------------------------
+E — EXTRA DETAILS
+-------------------------------------------------------------------------------
+
+- No new economic logic anywhere in app.py or src/app_logic.py. Every number
+  shown traces to engine.run_scenario() or a Step 9 reporter function.
+- No hard-coded line ids, SKU ids, or lever ranges. Sliders read
+  assumptions.levers.*.range; the line selector reads engine.line_master.
+- The five app_data/ files are the ONLY committed data artefacts in this
+  repo — everything else remains regenerated (D-055's reusability spirit).
+  If assumptions.yaml changes materially, these five must be regenerated from
+  Steps 5a/7/8 and re-committed; the fingerprint_status warning is what
+  catches a forgotten refresh, not a substitute for doing it.
+- No new dependency beyond streamlit itself — do not add a plotting library;
+  st.metric and st.bar_chart (both native) are sufficient at this scope.
+- Nothing is final until it has run — for this step, "run" means a successful
+  Streamlit Cloud deploy from the reviewer's own GitHub push, checked against
+  this notebook-free step's own test suite passing locally first (D-037's
+  principle, adapted: local pytest first, then the actual deploy is the real
+  verification, not a Colab run).
