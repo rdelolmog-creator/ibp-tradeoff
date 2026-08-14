@@ -1,0 +1,239 @@
+SNAKE PROMPT — STEP 7, OPTIMAL-POLICY MODEL
+IBP Trade-Off Engine · Week 6 Capstone · AI Finance Accelerator
+
+Step 7 of the §5 build order, redefined at D-064 and architecture v4. The
+previous definition — "learn cost response to schedule disruption" — is not
+built. A model learning cost from engine output would be learning the engine,
+which is circular and §9 territory.
+
+What Step 7 does instead:
+
+  (a) sweep the engine per SKU for the cost-minimising parameter set. This is
+      DETERMINISTIC and it is the operational answer.
+  (b) fit SKU ATTRIBUTES to those optimal parameters, benchmarked and explained
+      with SHAP, so a policy can be set for a SKU the engine cannot sweep —
+      principally a NEW LAUNCH, which has no demand history and therefore no
+      Step 5a characterisation, but does have every attribute the model needs
+      before its first shipment.
+
+The optimisation is deterministic. Machine learning explains and generalises
+the policy; it does not produce it. That sentence belongs in the pitch and on
+the limitations slide.
+
+Prerequisite: Step 6 gate passed (D-051, restated on the revised engine at
+D-060). Step 8 (broadening to all lines) and the O-10 review (D-063) come
+after.
+
+
+-------------------------------------------------------------------------------
+S — SPECIFY FILE TYPE AND DATA SOURCE
+-------------------------------------------------------------------------------
+
+New:      src/policy_model.py, step07_policy_model.ipynb, tests/test_policy_model.py
+Modified: none
+
+Inputs, all existing:
+
+  <data_root>/clean/clean_master.parquet     (sku_id, month)  2,159 rows  Step 4
+  <data_root>/clean/sku_master.parquet       sku_id           60 rows     Step 4
+  demand_characteristics.csv                 sku_id           60 rows     Step 5a
+  censoring_diagnostics.csv                  sku_id           60 rows     Step 5a
+  config/assumptions.yaml, config/schema.yaml                             Step 0
+  src/engine.py — TradeOffEngine, imported, NOT modified
+
+Intermediate artefact produced by this step:
+
+  optimal_policy.csv                         sku_id           60 rows
+
+ground_truth.csv is NOT an input. The policy model must never see it.
+
+
+-------------------------------------------------------------------------------
+N — NOTE THE ENVIRONMENT
+-------------------------------------------------------------------------------
+
+Google Colab, repo cloned to /content/ibp-tradeoff. Step 7 sits in the Colab
+block (steps 1-9 and 12).
+
+New dependencies, permitted here and ONLY here: scikit-learn, xgboost, shap.
+These must NOT be imported by src/engine.py or by app.py's critical path — the
+Streamlit app at Step 10 consumes optimal_policy.csv and the fitted model's
+predictions, it does not fit models at runtime. Guard the imports inside
+src/policy_model.py so the rest of the pipeline stays free of them.
+
+src/policy_model.py contains no Colab-specific calls.
+
+
+-------------------------------------------------------------------------------
+A — ACTION TO PERFORM
+-------------------------------------------------------------------------------
+
+PART 1 — the deterministic sweep (no ML)
+-----------------------------------------
+In src/policy_model.py, class PolicyOptimiser:
+
+  __init__(self, engine, line_id)
+      Takes an already-constructed TradeOffEngine. Does not rebuild it.
+
+  sku_grid(self, sku_id, cover_values, service_values) -> pd.DataFrame
+      For one SKU, evaluate the cost surface over the Cartesian product of
+      inventory_cover_weeks x service_target, holding min_run_hours at the line
+      default. Returns one row per grid point with the four economic outputs
+      and the total.
+
+      IMPORTANT — the per-SKU isolation problem. Conversion cost is a LINE
+      property: changeovers and capacity are shared across the SKUs on a line,
+      so a single SKU's cost is not separable from its neighbours'. Two
+      admissible treatments, and the choice must be stated not assumed:
+        (i)  hold every other SKU at the line default and vary one SKU at a
+             time, attributing the DELTA in line conversion cost to that SKU;
+        (ii) exclude conversion cost from the per-SKU objective entirely and
+             optimise the three separable outputs.
+      Implement (i) as the default and expose (ii) as a flag. Report both in
+      the notebook — if the chosen optimum differs between them, that is a
+      finding about the separability of the objective and must be logged, not
+      smoothed over.
+
+  optimise(self, cover_values, service_values) -> pd.DataFrame
+      Runs sku_grid for every SKU on the line, returns one row per SKU:
+      sku_id, optimal_cover_weeks, optimal_service_target, total cost at the
+      optimum, cost at the line default, and the saving between them.
+
+      Flag any SKU whose optimum sits at a grid EDGE. An edge optimum means the
+      true optimum is outside the searched range and the value is not a real
+      optimum — it must not be fed to the model as if it were.
+
+  Grid resolution comes from assumptions.levers.*.range, not from literals.
+  Use a grid, not a continuous optimiser: the surface is not smooth (min-run
+  rounding and the excess threshold both create steps), so gradient methods
+  would find artefacts.
+
+Write optimal_policy.csv with, per SKU:
+  sku_id, line_id, optimal_cover_weeks, optimal_service_target,
+  total_cost_at_optimum_eur, total_cost_at_default_eur, saving_eur,
+  edge_optimum_flag, assumption_fingerprint
+
+
+PART 2 — the policy model (ML)
+-------------------------------
+In src/policy_model.py, class PolicyModel:
+
+  Targets  : optimal_cover_weeks, optimal_service_target (two separate models)
+  Features : category, abc_class, gross_margin_eur, price_eur, std_cost_eur,
+             shelf_life_days, case_size, moq_units, min_run_units,
+             line_speed_units_hr, irreducible_volatility_cv, chronic_bias_l1
+
+  Two feature sets, fitted and reported separately — this is the point of the
+  step, not an extra:
+      FULL   : all features above
+      LAUNCH : excludes irreducible_volatility_cv and chronic_bias_l1, because
+               a new launch has no demand history and therefore neither. This
+               is the set that will actually be used in the launch case.
+  Reporting only FULL would overstate real-world performance.
+
+  fit(self, X, y, feature_set) -> fitted estimators
+      Two estimators per target: an XGBoost regressor and a linear benchmark
+      (ridge, with categorical features one-hot encoded). The benchmark is not
+      a formality — with 60 rows and largely categorical features, the linear
+      model may well win, and that is a legitimate and reportable result.
+
+  evaluate(self) -> pd.DataFrame
+      Leave-one-out cross-validation, NOT a train/test split — 60 rows will not
+      support a holdout. Report MAE and R2 per target, per feature set, per
+      estimator, plus a naive baseline (predict the ABC-class mean) so the
+      reader can see whether either model beats "use the class default".
+      If neither beats the naive baseline, SAY SO. That is the honest result
+      and it is more informative than a tuned number.
+
+  explain(self) -> SHAP values
+      SHAP on the winning estimator per target. The deliverable is the planner-
+      readable statement: which SKU attributes drive a SKU toward high cover,
+      and in which direction.
+
+  predict_launch(self, attributes: dict) -> dict
+      The operational output. Takes a new SKU's known attributes, returns
+      recommended opening cover and service target using the LAUNCH model.
+      Must refuse, not guess, if a required attribute is missing.
+
+
+TESTS — tests/test_policy_model.py
+-----------------------------------
+  test_optimiser_finds_interior_optimum_for_most_skus
+      an all-edge result means the grid is wrong, not that every SKU wants an
+      extreme policy.
+  test_edge_optima_are_flagged_and_excluded_from_training
+  test_launch_feature_set_excludes_history_derived_features
+      asserts irreducible_volatility_cv and chronic_bias_l1 are absent — the
+      whole launch case fails silently if they leak in.
+  test_leave_one_out_is_used_not_a_holdout
+  test_naive_baseline_is_reported
+  test_predict_launch_refuses_incomplete_attributes
+  test_ground_truth_not_importable
+  test_engine_is_not_modified_by_the_optimiser
+      run_scenario at the default gives identical totals before and after a
+      full optimise() pass.
+  test_policy_model_imports_do_not_leak_into_engine
+      importing src.engine must not pull in sklearn, xgboost or shap.
+
+
+NOTEBOOK step07_policy_model.ipynb
+-----------------------------------
+Thin orchestration only, no logic in cells. Clone, rebuild Step 4 artefacts,
+upload the two Step 5a CSVs, construct the engine, run the optimiser, fit and
+evaluate both feature sets, plot SHAP, demonstrate predict_launch on a
+hypothetical new SKU, and print a Step 7 report in the same shape as the Step 6
+gate report — always rebuilding, never reusing an in-memory object, and
+printing the engine.py hash in the header.
+
+
+-------------------------------------------------------------------------------
+K — KEY DATA STRUCTURE
+-------------------------------------------------------------------------------
+
+optimal_policy.csv — 15 rows for the MVD line, 60 once run across all lines
+
+sku_id  line_id  optimal_cover_weeks  optimal_service_target  total_cost_at_optimum_eur  total_cost_at_default_eur  saving_eur  edge_optimum_flag
+A-05    L3       3.5                  0.985                   284117.40                  291022.86                  6905.46     False
+A-08    L3       4.0                  0.990                   198443.12                  198443.12                  0.00        False
+A-37    L3       2.5                  0.975                   141880.55                  149307.21                  7426.66     False
+A-41    L3       6.0                  0.995                    88210.03                   93664.80                  5454.77     False
+A-52    L3       8.0                  0.995                    41905.77                   46002.31                  4096.54     True
+
+evaluate() output — the comparison table the rubric asks for
+
+target                  feature_set  estimator  mae     r2      beats_naive
+optimal_cover_weeks     FULL         xgboost    0.61    0.58    True
+optimal_cover_weeks     FULL         ridge      0.74    0.41    True
+optimal_cover_weeks     LAUNCH       xgboost    0.88    0.22    True
+optimal_cover_weeks     LAUNCH       ridge      0.91    0.18    False
+optimal_service_target  FULL         xgboost    0.0041  0.44    True
+
+Illustrative shape only. The numbers above are placeholders and must not be
+quoted; MAGNITUDES ARE NOT FINDINGS (§10), and with 60 rows the honest outcome
+may well be that neither model beats the naive baseline on the LAUNCH set.
+
+
+-------------------------------------------------------------------------------
+E — EXTRA DETAILS
+-------------------------------------------------------------------------------
+
+- No hard-coded paths, SKU lists, line ids, category names or rates. Grid
+  ranges read from assumptions.levers.*.range.
+- src/engine.py is NOT modified. Step 7 consumes it.
+- sklearn, xgboost and shap are confined to src/policy_model.py and must not
+  become import-time dependencies of the engine or the app's critical path.
+- min_run_hours is deliberately excluded from the per-SKU optimum: it is a LINE
+  decision, and changeovers are a property of the sequence on a line, not of
+  any one SKU. forecast_bias_correction is excluded too — it is a planner-
+  accountability lever, not a per-SKU policy parameter.
+- Every artefact carries the assumption fingerprint. A policy optimised under
+  one assumption set is not valid under another.
+- Determinism: the sweep has no RNG. The ML step must seed everything and
+  report the seed.
+- Two limitations to carry into Step 13, stated in the notebook and not only in
+  the code: (a) the most predictive features are exactly the ones a new launch
+  lacks, so LAUNCH performance is the honest number and FULL is the optimistic
+  one; (b) a policy rule fitted on 60 SKUs is defensible as method, not as a
+  number.
+- Nothing is final until it has run in Colab and the numbers have been
+  confirmed by the reviewer's own run (D-037).
