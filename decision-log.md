@@ -352,5 +352,10 @@ DECISION: `app.py`/`src/app_logic.py` fully rewritten to match the dashboard moc
 
 `app_data/optimal_policy.csv` is deleted (superseded by `line_results.csv` + `sku_level.csv`, matching Step 7/9's real output shape). 132/132 tests pass across every module — the `test_app_logic.py` collection failure noted as a known gap in D-072 is now closed.
 
+**D-074 · Sandbox data contamination caught before merge — app_data corrected to real Step 5a output**
+DECISION: the `app_data/line_results.csv` and `sku_level.csv` committed in D-073's initial push were built from a contaminated sandbox copy of `demand_characteristics.csv`/`censoring_diagnostics.csv` (5 flagged SKUs, not the real 14) — the same sandbox contamination flagged repeatedly earlier in this project's build. Caught by a direct check before considering D-073 closed, not discovered later. The real files (14 flagged, matching every Colab-confirmed run) were recovered from the ORIGINAL `main` branch commit, where the user's genuine Step 5a upload had already been committed during the first Step 10 build.
+
+Sandbox's `data_primary/clean/demand_characteristics.csv` and `censoring_diagnostics.csv` were overwritten with the real files at the source, and `search_all_lines(n=3)` was re-run end to end (206s). Corrected total saving vs true per-class default: **EUR 615,470** (previously reported, on contaminated data: EUR 619,889 — a ~4.4k difference, not large, but the contaminated figure was never the number to trust regardless of magnitude). All four lines remain fully capacity-feasible at the corrected optimum. App re-verified via AppTest against the corrected `app_data/` — clean, 132/132 tests.
+
 
 *(pending)*
