@@ -222,7 +222,28 @@ class PolicyOptimiser:
         base_conv = float(self._baseline.line_month["conversion_cost_eur"].sum())
         frames: List[pd.DataFrame] = []
 
-        for cover, service in itertools.product(cover_values, service_values):
+        # D-067. Each SKU's default depends on its OWN abc_class (service
+        # floor and target cover both vary by class — see assumptions.abc),
+        # but the grid is built once from the overall lever range. A class's
+        # default therefore often does not land on the shared grid, and
+        # because the cost surface is NOT smooth (min-run rounding, the
+        # excess-cover threshold both create steps), a coarse grid can score
+        # worse everywhere it samples than a default point it never tested.
+        # The optimum must never lose to the default, so every distinct
+        # class default actually present on this line is added as an
+        # explicit candidate point, not just used as the comparison baseline.
+        class_defaults = set()
+        for s_id in self.skus:
+            cat = str(self.engine.sku_master.loc[s_id, "category"])
+            abc = str(self.engine.sku_master.loc[s_id, "abc_class"])
+            dl = LeverSettings.defaults(self.assumptions, cat, abc)
+            class_defaults.add(
+                (dl.inventory_cover_weeks, dl.service_target)
+            )
+        grid_points = set(itertools.product(cover_values, service_values))
+        eval_points = grid_points | class_defaults
+
+        for cover, service in eval_points:
             levers = self.base_levers.replace(
                 inventory_cover_weeks=float(cover), service_target=float(service)
             )
@@ -264,25 +285,46 @@ class PolicyOptimiser:
         best_idx = surface.groupby("sku_id")["total_eur"].idxmin()
         best = surface.loc[best_idx].set_index("sku_id")
 
-        default_mask = (
-            surface["inventory_cover_weeks"]
-            == self.base_levers.inventory_cover_weeks
-        ) & (surface["service_target"] == self.base_levers.service_target)
-        if default_mask.any():
-            default_cost = surface[default_mask].set_index("sku_id")["total_eur"]
-        else:  # default not on the grid — evaluate it explicitly
-            res = self.engine.run_scenario(self.line_id, self.base_levers)
-            default_cost = (
-                res.sku_month.groupby("sku_id")[
-                    [
-                        "lost_sales_eur",
-                        "excess_obsolescence_eur",
-                        "working_capital_cost_eur",
-                    ]
-                ]
-                .sum()
-                .sum(axis=1)
+        # D-067 (continued) — the real root cause. total_cost_at_default_eur
+        # must be each SKU's OWN class default, not self.base_levers applied
+        # uniformly, which is always class A's policy. A class-B or class-C
+        # SKU compared against class A's (tighter) service floor and shorter
+        # cover was being scored against a policy that was never its own —
+        # every one of the observed "negative savings" was a class-B SKU.
+        default_lookup: Dict[str, Tuple[float, float]] = {}
+        for s_id in self.skus:
+            dl = LeverSettings.defaults(
+                self.assumptions,
+                str(self.engine.sku_master.loc[s_id, "category"]),
+                str(self.engine.sku_master.loc[s_id, "abc_class"]),
             )
+            default_lookup[s_id] = (dl.inventory_cover_weeks, dl.service_target)
+
+        default_by_sku: Dict[str, float] = {}
+        surface_idx = surface.set_index(
+            ["sku_id", "inventory_cover_weeks", "service_target"]
+        )["total_eur"]
+        for s_id in self.skus:
+            key = (s_id,) + default_lookup[s_id]
+            if key in surface_idx.index:
+                default_by_sku[s_id] = float(surface_idx.loc[key])
+        missing = set(self.skus) - set(default_by_sku)
+        if missing:
+            # a class default was not among eval_points for some reason —
+            # evaluate it directly rather than silently falling back to A
+            for s_id in missing:
+                cov, srv = default_lookup[s_id]
+                dl = self.base_levers.replace(
+                    inventory_cover_weeks=cov, service_target=srv
+                )
+                res = self.engine.run_scenario(self.line_id, dl)
+                row = res.sku_month[res.sku_month["sku_id"] == s_id]
+                default_by_sku[s_id] = float(
+                    row["lost_sales_eur"].sum()
+                    + row["excess_obsolescence_eur"].sum()
+                    + row["working_capital_cost_eur"].sum()
+                )
+        default_cost = pd.Series(default_by_sku)
 
         c_min, c_max = min(cover_values), max(cover_values)
         s_min, s_max = min(service_values), max(service_values)
