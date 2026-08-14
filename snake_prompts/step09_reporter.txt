@@ -1,0 +1,203 @@
+SNAKE PROMPT — STEP 9, REPORTER
+IBP Trade-Off Engine · Week 6 Capstone · AI Finance Accelerator
+
+Step 9 of the §5 build order: aggregation, owner mapping, artefacts. This is
+the step where three findings that have been true in the data since Step 6/7/8
+finally become visible to a reader who has not been in this chat — none of
+them are new mechanisms, all of them are reporting decisions already made and
+logged:
+
+  D-062  the four outputs are shown as AVOIDABLE cost (conversion excludes
+         fixed absorption), with the €3.6M absorption displayed separately
+         and labelled — not silently dropped
+  D-066  the per-SKU policy optimum is over cover and service only;
+         conversion cost is a line decision, reported as such
+  D-070  a warning on the L2 + high-cover combination specifically, because
+         that is the one setting the engine itself found that breaches
+         capacity — O-10 closed this as "documented, not rebuilt"
+
+No new mechanisms, no new economic logic. src/engine.py, src/policy_model.py
+and src/portfolio_sweep.py are CONSUMED, not modified.
+
+
+-------------------------------------------------------------------------------
+S — SPECIFY FILE TYPE AND DATA SOURCE
+-------------------------------------------------------------------------------
+
+New:      src/reporter.py, step09_reporter.ipynb, tests/test_reporter.py
+Modified: none
+
+Inputs, all existing artefacts — nothing new is computed, this step packages
+what Steps 6-8 already produced:
+
+  <data_root>/clean/clean_master.parquet, sku_master.parquet    Step 4
+  demand_characteristics.csv, censoring_diagnostics.csv          Step 5a
+  optimal_policy.csv                                              Step 7
+  portfolio_sweep.csv, step08_portfolio_summary.csv,
+  step08_lever_consistency.csv                                    Step 8
+  config/assumptions.yaml, config/schema.yaml                     Step 0
+
+If any of these is missing, the reporter must say so and name which upstream
+step produces it — not recompute it silently. Recomputing here would create a
+second place these numbers could diverge from their source of truth.
+
+
+-------------------------------------------------------------------------------
+N — NOTE THE ENVIRONMENT
+-------------------------------------------------------------------------------
+
+Google Colab, repo cloned to /content/ibp-tradeoff. Same dependencies as Step
+6 — pandas, numpy, pyyaml. No new dependencies; this step formats and
+aggregates, it does not model.
+
+src/reporter.py contains no Colab-specific calls — it is imported unchanged by
+app.py at Step 10, so this is the first module written with the Streamlit
+consumer explicitly in mind.
+
+
+-------------------------------------------------------------------------------
+A — ACTION TO PERFORM
+-------------------------------------------------------------------------------
+
+In src/reporter.py:
+
+  def avoidable_cost_view(scenario_result, assumptions) -> dict
+      Takes one ScenarioResult (from TradeOffEngine.run_scenario). Returns the
+      four outputs with conversion cost split into avoidable and fixed:
+        lost_sales_eur, excess_obsolescence_eur, working_capital_cost_eur,
+        conversion_cost_avoidable_eur, conversion_cost_fixed_eur,
+        total_avoidable_cost_eur, total_reported_cost_eur
+      fixed = fixed_absorption_eur_line_month x horizon_months, read from
+      assumptions, never hard-coded (D-062). total_avoidable_cost_eur is the
+      sum of the four LEVER-RESPONSIVE outputs; total_reported_cost_eur adds
+      the fixed absorption back for anyone who needs the full P&L number.
+      Both are returned — never only one — because reporting only the avoidable
+      figure without the reconciling total is how a plant controller ends up
+      thinking the model lost €3.6M of their P&L (the exact failure mode D-062
+      was written to prevent).
+
+  def capacity_warning(line_id, levers, portfolio_summary_row) -> Optional[str]
+      D-070. Given a proposed lever setting and that line's row from
+      step08_portfolio_summary.csv, return a warning string if the setting
+      resembles the region that produces a capacity breach, else None. Do NOT
+      hard-code "L2" or a specific cover value — read worst_case conditions
+      from portfolio_summary_row and flag when the proposed inventory_cover_weeks
+      is within one grid-step of the line's worst-case breaching value AND
+      any_capacity_breach is True for that line. Generalises to any line that
+      develops the same pattern later, rather than encoding today's one
+      finding as a permanent special case.
+
+  def owner_view(scenario_result, sku_master, assumptions) -> pd.DataFrame
+      Maps each of the four outputs to the accountable role, from
+      assumptions — do not invent a mapping here if one already exists in
+      config; if it does not exist, add ONE new assumptions.yaml block
+      (owner_mapping: {lost_sales: "...", excess: "...", ...}) at role level,
+      per D-011's stated principle (accountability at role level, not named
+      individuals).
+
+  def policy_brief(optimal_policy, sku_master, top_n=10) -> pd.DataFrame
+      The SKUs with the largest saving_eur (Step 7), joined to their category
+      and ABC class, formatted for a planner to act on directly — sku_id,
+      category, abc_class, current-vs-optimal cover and service, saving_eur.
+      This is the "so what do I actually change" artefact — Step 7 produced
+      the optimum, this step makes it actionable.
+
+  def portfolio_brief(portfolio_summary, lever_consistency) -> str
+      A short plain-text summary: which lines are healthy, which line (if any)
+      carries a capacity risk and under what condition, which lever
+      directions are consistent vs line-specific. This is the paragraph a CFO
+      reads before the four-output table, not a restatement of the tables.
+
+  def export_artefacts(..., out_dir) -> dict[str, str]
+      Writes avoidable_cost_summary.csv, policy_brief.csv, portfolio_brief.txt
+      to out_dir. Returns the paths. No plotting library dependency here —
+      Step 10 (Streamlit) owns visualisation; this step owns the numbers.
+
+TESTS — tests/test_reporter.py:
+
+  test_avoidable_and_reported_totals_both_present
+      never only one — the exact omission D-062 warns against.
+  test_fixed_absorption_read_from_assumptions_not_hardcoded
+      change the assumptions value in a fixture and assert the reported fixed
+      figure changes with it.
+  test_capacity_warning_fires_near_the_known_breach_condition
+      using the real Step 8 output, a proposed L2 setting near cover=10
+      returns a warning; a proposed L2 setting near cover=4 (the line's own
+      optimum) does not.
+  test_capacity_warning_does_not_hardcode_a_line_name
+      construct a synthetic portfolio_summary_row for a DIFFERENT line id with
+      any_capacity_breach=True and assert the function still fires — proves
+      the logic generalises rather than special-casing "L2" as a string.
+  test_missing_upstream_artefact_raises_with_the_producing_step_named
+      the message must name which step (6, 7, or 8) produces the missing file
+      — a bare FileNotFoundError does not tell the reader what to go run.
+  test_reporter_does_not_recompute_engine_outputs
+      inspect that src/reporter.py never imports TradeOffEngine.run_scenario's
+      internals or re-derives lost_sales_eur etc. from raw quantities — it may
+      only reshape totals it is handed.
+  test_policy_brief_sorted_by_saving_descending
+  test_export_writes_expected_files
+
+
+NOTEBOOK step09_reporter.ipynb:
+  Thin orchestration. Load the upstream artefacts (Steps 4/5a/7/8 must have
+  already been run and their outputs present — the notebook checks for each
+  file and names the producing step if absent, per the reporter's own
+  contract). Build the avoidable-cost view for the Step 6 gate scenario as a
+  worked example, run the capacity-warning check against a couple of
+  illustrative lever settings, print the policy brief and portfolio brief.
+  ONE consolidated report cell at the end, per the Step 6/7/8 convention.
+
+
+-------------------------------------------------------------------------------
+K — KEY DATA STRUCTURE
+-------------------------------------------------------------------------------
+
+avoidable_cost_view() output:
+
+  {
+    "lost_sales_eur": 42014.05,
+    "excess_obsolescence_eur": 261363.70,
+    "working_capital_cost_eur": 184699.93,
+    "conversion_cost_avoidable_eur": 220954.45,
+    "conversion_cost_fixed_eur": 3600000.00,
+    "total_avoidable_cost_eur": 709032.13,
+    "total_reported_cost_eur": 4309032.13
+  }
+
+capacity_warning() output — a string or None, e.g.:
+
+  "L2: inventory_cover_weeks=9.5 is within range of settings this engine
+   found to breach capacity (worst case: utilisation 1.15x, 720 overtime
+   hours/year). This line's own cost-optimal setting is cover=4.0 weeks."
+
+policy_brief() — top rows by saving_eur
+
+  sku_id  category        abc_class  current_cover  optimal_cover  current_service  optimal_service  saving_eur
+  A-37    personal_care    A         4.0             5.5            0.985            0.880             16957.62
+  ...
+
+Illustrative shape only. MAGNITUDES ARE NOT FINDINGS (§10) — this step's job
+is correct aggregation and honest labelling, not new numbers.
+
+
+-------------------------------------------------------------------------------
+E — EXTRA DETAILS
+-------------------------------------------------------------------------------
+
+- src/engine.py, src/policy_model.py, src/portfolio_sweep.py are NOT modified.
+  This step reads their outputs.
+- No hard-coded line ids, SKU ids, or cost values anywhere in src/reporter.py
+  — test_capacity_warning_does_not_hardcode_a_line_name exists specifically
+  to catch this.
+- If owner_mapping does not already exist in assumptions.yaml, add it as ONE
+  new block, at role level (D-011), and log the addition as a decision when
+  this step is reviewed — do not invent it silently inside reporter.py.
+- Both total_avoidable_cost_eur and total_reported_cost_eur must always be
+  returned together. A function that returns only one is a defect, not a
+  simplification — this is the direct implementation of D-062's stated
+  purpose.
+- No plotting/visualisation dependency in this module — that is Step 10's
+  job. Step 9 produces correct, labelled numbers; Step 10 makes them visual.
+- Nothing is final until it has run in Colab and been confirmed by the
+  reviewer's own run (D-037).
