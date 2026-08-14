@@ -74,15 +74,25 @@ class PolicyOptimiser:
     and capacity are shared across the SKUs on a line, so one SKU's cost is not
     separable from its neighbours'. Two admissible treatments:
 
-      'delta'     hold every other SKU at the line default, vary one SKU, and
-                  attribute the CHANGE in line conversion cost to that SKU.
       'separable' exclude conversion cost from the per-SKU objective and
-                  optimise only the three separable outputs.
+                  optimise only the three separable outputs. THE DEFAULT.
+      'delta'     attribute the change in line conversion cost across SKUs
+                  pro-rata by run hours. Retained for comparison only.
 
-    Neither is obviously right. 'delta' is the default because it keeps all four
-    outputs in the objective, but both are computed and the notebook reports
-    both. If the chosen optimum differs between them, that is a finding about
-    whether the objective is separable at all — log it, do not smooth it over.
+    'separable' is the default per O-16. Measured on the MVD line, 8 of 15 SKUs
+    chose a DIFFERENT optimum under the two modes — so the per-SKU answer was
+    partly an artefact of an arbitrary attribution rule, and pro-rata by run
+    hours is only one defensible split among several. A result that depends on
+    that choice is not a result.
+
+    This also matches the architecture's own division of levers: min_run_hours
+    is the LINE lever, cover and service are the SKU levers. Making a per-SKU
+    optimum depend on a line-level joint cost contradicts that split.
+
+    The cost of the choice, which belongs on the limitations slide rather than
+    being hidden behind a fake attribution: a SKU that wants small frequent
+    batches genuinely does impose changeover cost on its neighbours, and
+    'separable' does not see that interaction.
     """
 
     def __init__(self, engine: TradeOffEngine, line_id: str) -> None:
@@ -160,7 +170,7 @@ class PolicyOptimiser:
         sku_id: str,
         cover_values: Sequence[float],
         service_values: Sequence[float],
-        mode: str = "delta",
+        mode: str = "separable",
     ) -> pd.DataFrame:
         """Cost surface for one SKU. min_run_hours held at the line default.
 
@@ -195,7 +205,7 @@ class PolicyOptimiser:
         self,
         cover_values: Optional[Sequence[float]] = None,
         service_values: Optional[Sequence[float]] = None,
-        mode: str = "delta",
+        mode: str = "separable",
     ) -> pd.DataFrame:
         """One row per SKU: its cost-minimising cover and service target.
 
@@ -309,6 +319,35 @@ class PolicyOptimiser:
         )
         out["assumption_fingerprint"] = self.engine.assumption_fingerprint
         return out.reset_index(drop=True)
+
+
+def optimise_all_lines(
+    engine: TradeOffEngine,
+    n_cover: int = 7,
+    n_service: int = 6,
+    mode: str = "separable",
+) -> pd.DataFrame:
+    """Sweep every line, returning one policy row per SKU across the portfolio.
+
+    Required, not optional (D-065). Within a single line, category, line speed,
+    shelf life, price, standard cost, case size, MOQ and minimum run are all
+    CONSTANT — nine of the ten attribute features have zero variance, which
+    forces the policy model to reduce to the ABC-class mean it is benchmarked
+    against. Fitting on one line cannot discriminate; it is not a weak result
+    but an uninterpretable one.
+
+    The optimiser is already line-agnostic, so this is a loop, not new logic.
+    """
+    frames: List[pd.DataFrame] = []
+    for line_id in engine.line_master["line_id"]:
+        if not engine.line_skus(line_id):
+            continue
+        opt = PolicyOptimiser(engine, line_id)
+        cover, service = opt.default_grid(n_cover=n_cover, n_service=n_service)
+        frames.append(opt.optimise(cover, service, mode=mode))
+    if not frames:
+        raise PolicyModelViolation("no line produced a policy")
+    return pd.concat(frames, ignore_index=True)
 
 
 # ---------------------------------------------------------------------------
