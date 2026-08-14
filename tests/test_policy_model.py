@@ -107,6 +107,24 @@ def test_optimum_is_never_worse_than_the_default(optimal_policy):
     assert float(optimal_policy["saving_eur"].min()) >= -1e-6
 
 
+def test_optimum_never_worse_than_default_across_all_abc_classes(engine):
+    """D-067. Bug found on the real Colab run: default cost was computed from
+    class A's policy applied to every SKU, so B/C-class SKUs were compared
+    against a policy that was never their own and showed negative savings.
+    Requires all three ABC classes present, which the MVD line alone may not
+    guarantee — run on the full portfolio.
+    """
+    from src.policy_model import optimise_all_lines
+
+    pol = optimise_all_lines(engine, n_cover=7, n_service=6)
+    classes_present = engine.sku_master.loc[pol["sku_id"], "abc_class"].unique()
+    assert len(classes_present) > 1, "test requires more than one ABC class"
+    assert float(pol["saving_eur"].min()) >= -1e-6, (
+        "a SKU's saving went negative — its default was almost certainly "
+        "computed from another class's policy, not its own"
+    )
+
+
 def test_optimum_lies_within_the_admissible_lever_range(optimal_policy, assumptions):
     lev = assumptions["levers"]
     c_lo, c_hi = (float(v) for v in lev["inventory_cover_weeks"]["range"])
