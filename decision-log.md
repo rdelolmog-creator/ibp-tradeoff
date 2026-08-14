@@ -368,5 +368,14 @@ A new function, `sku_level_for_policy_model()`, reshapes `expand_to_sku_level()`
 
 Both rebuilt notebooks executed end to end in the sandbox (Step 7: ~340s including its own test suite; Step 9: fast, reusing Step 7's cached search result) with all consolidated-report checks PASS. 132/132 tests across every module; `app.py` re-verified via `AppTest` against the fully corrected `app_data/`.
 
+**D-078 · "Jump to base"/"Jump to optimal" did not move the sliders — a Streamlit session_state trap, and a gap in my own testing**
+DECISION: fixed a real bug the user caught by using the app, not by anything in the automated test suite. Each slider is created with a `key=` (e.g. `svc_A`). Streamlit's actual rule: once a widget's key exists in `session_state`, the widget's `value=` argument is IGNORED on every subsequent rerun — only `session_state[key]` is read. The original preset-button code updated a separate `current_levers` dict and passed it into `value=`, which never touched the sliders' own keys — clicking the button registered (no exception, no visible error) but the sliders never moved.
+
+Fixed by writing directly into each slider's own `session_state` key (`svc_A`, `cov_A`, ... 12 keys total) inside the button handler, followed by `st.rerun()`. A second issue surfaced during the fix: passing both `value=` and a pre-existing `session_state[key]` in the same run triggers a Streamlit policy warning (not yet a hard error, but flagged as discouraged and liable to become one). Resolved properly — `session_state[key]` is seeded once, before the widget is first created, and `value=` is dropped from every slider call thereafter, matching Streamlit's own recommended pattern.
+
+**Why this passed my own verification the first time.** Prior `AppTest` checks confirmed clicking the button caused no exception, and confirmed capacity warnings fired correctly under manually-set slider values via `.set_value()` — but never checked that the PRESET BUTTONS themselves changed slider VALUES. That is a real gap in the verification method itself, not just the code: "no exception" is necessary but not sufficient evidence a UI action did what it claims. A permanent regression test now asserts a slider's value changes after a preset click, not merely that the app survives the click.
+
+Re-verified end to end: manually move a slider, confirm it moved; click "Jump to base", confirm it returns to the true per-class default (`svc_A=0.985`, `cov_C=6.0`); click "Jump to optimal", confirm it moves to Step 7's actual per-line optimum (`svc_A=0.88`, `cov_C=1.0` for L1) — genuinely different values, not a repeat of Base. 133/133 tests pass.
+
 
 *(pending)*

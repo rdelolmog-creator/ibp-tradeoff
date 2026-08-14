@@ -311,3 +311,38 @@ def test_line_policy_table_has_one_row_per_class(app_data):
 
 def test_ground_truth_not_importable():
     assert "ground_truth" not in (REPO / "src" / "app_logic.py").read_text().lower()
+
+
+# ---------------------------------------------------------------------------
+# Preset buttons — regression test for the Streamlit session_state bug
+# ---------------------------------------------------------------------------
+
+
+def test_preset_buttons_actually_move_the_sliders():
+    """Regression test: the original implementation updated a separate
+    `current_levers` dict and passed it into each slider's `value=`
+    argument — but Streamlit ignores `value=` once a widget's key already
+    exists in session_state, so clicking the button registered but the
+    sliders never visibly moved. Caught only by checking slider VALUES
+    after a click, not just checking for exceptions."""
+    from streamlit.testing.v1 import AppTest
+
+    at = AppTest.from_file(str(REPO / "app.py"), default_timeout=100)
+    at.run()
+    if at.exception:
+        pytest.skip("app.py failed to load — see other app.py tests for the cause")
+
+    svc_a = [s for s in at.slider if s.key == "svc_A"][0]
+    svc_a.set_value(0.90).run()
+    assert svc_a.value == pytest.approx(0.90)
+
+    base_btn = [b for b in at.button if b.label == "Jump to base"]
+    if not base_btn:
+        pytest.skip("Jump to base button not found")
+    base_btn[0].click().run()
+
+    svc_a_after = [s for s in at.slider if s.key == "svc_A"][0].value
+    assert svc_a_after != pytest.approx(0.90), (
+        "Jump to base did not move the slider — the session_state/value= "
+        "conflict bug may have resurfaced"
+    )

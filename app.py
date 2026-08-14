@@ -117,13 +117,34 @@ if len(categories_in_selection) > 1:
 primary_line = selected_lines[0]
 base_levers = base_levers_for_line(engine, assumptions, primary_line)
 
-if "current_levers" not in st.session_state:
-    st.session_state.current_levers = base_levers.as_dict()
+SLIDER_FIELD_KEYS = {
+    "service_target": "svc", "inventory_cover_weeks": "cov",
+    "forecast_bias_correction": "bias", "min_run_hours": "mrh",
+}
+
+
+def _apply_preset(preset: LeverSettings) -> None:
+    """Set each slider's OWN session_state key directly.
+
+    Streamlit ignores a slider's `value=` argument once its key already
+    exists in session_state — only session_state[key] is read on rerun. The
+    earlier version updated a separate `current_levers` dict and passed it
+    into `value=`, which never touched the sliders' own keys, so the buttons
+    registered a click but the sliders never visibly moved. This is the fix:
+    write directly into the keys the sliders actually read.
+    """
+    for field, prefix in SLIDER_FIELD_KEYS.items():
+        for cls in ABC_CLASSES:
+            st.session_state[f"{prefix}_{cls}"] = float(
+                preset.resolve(field, cls)
+            )
+
 
 preset_col1, preset_col2 = st.columns(2)
 with preset_col1:
     if st.button("Jump to base"):
-        st.session_state.current_levers = base_levers.as_dict()
+        _apply_preset(base_levers)
+        st.rerun()
 with preset_col2:
     optimal_disabled = n_lines > 1
     if st.button(
@@ -133,14 +154,14 @@ with preset_col2:
         "have independently-found optima." if optimal_disabled else None,
     ):
         opt = optimal_levers_for_line(app_data["line_results"], primary_line)
-        st.session_state.current_levers = opt.as_dict()
+        _apply_preset(opt)
+        st.rerun()
 
 # --------------------------------------------------------------------------
 # Sliders — per ABC class, all four levers
 # --------------------------------------------------------------------------
 
 st.subheader("Levers, per ABC class")
-cur = st.session_state.current_levers
 class_cols = st.columns(3)
 new_levers: dict = {
     "service_target": {}, "inventory_cover_weeks": {},
@@ -160,29 +181,35 @@ for i, cls in enumerate(ABC_CLASSES):
         )
         st.markdown(f"**Class {cls}** — {n_skus} SKUs")
 
-        def _cur(field, default):
-            v = cur.get(field, default)
-            return float(v[cls]) if isinstance(v, dict) else float(v)
+        # Streamlit warns (and may one day error) if a widget receives both
+        # `value=` and an already-present session_state[key] in the same
+        # run — the two can conflict. The correct pattern: seed
+        # session_state once, before the widget exists, then let the widget
+        # read from its key alone on every subsequent run.
+        for field, prefix, default_fn in (
+            ("service_target", "svc", lambda c: base_levers.resolve("service_target", c)),
+            ("inventory_cover_weeks", "cov", lambda c: base_levers.resolve("inventory_cover_weeks", c)),
+            ("forecast_bias_correction", "bias", lambda c: base_levers.resolve("forecast_bias_correction", c)),
+            ("min_run_hours", "mrh", lambda c: base_levers.resolve("min_run_hours", c)),
+        ):
+            key = f"{prefix}_{cls}"
+            if key not in st.session_state:
+                st.session_state[key] = float(default_fn(cls))
 
         new_levers["service_target"][cls] = st.slider(
-            "Service target", st_lo, st_hi,
-            _cur("service_target", 0.95), 0.005, key=f"svc_{cls}",
+            "Service target", st_lo, st_hi, step=0.005, key=f"svc_{cls}",
         )
         new_levers["inventory_cover_weeks"][cls] = st.slider(
-            "Cover (weeks)", cov_lo, cov_hi,
-            _cur("inventory_cover_weeks", 4.0), 0.5, key=f"cov_{cls}",
+            "Cover (weeks)", cov_lo, cov_hi, step=0.5, key=f"cov_{cls}",
         )
         new_levers["forecast_bias_correction"][cls] = st.slider(
-            "Bias correction", bias_lo, bias_hi,
-            _cur("forecast_bias_correction", 0.0), 0.05, key=f"bias_{cls}",
+            "Bias correction", bias_lo, bias_hi, step=0.05, key=f"bias_{cls}",
         )
         new_levers["min_run_hours"][cls] = st.slider(
-            "Min run (hours)", mrh_lo, mrh_hi,
-            _cur("min_run_hours", 7.0), 0.5, key=f"mrh_{cls}",
+            "Min run (hours)", mrh_lo, mrh_hi, step=0.5, key=f"mrh_{cls}",
         )
 
 levers = LeverSettings(**new_levers).validate(assumptions)
-st.session_state.current_levers = levers.as_dict()
 
 # --------------------------------------------------------------------------
 # Assumptions panel
