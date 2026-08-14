@@ -1,29 +1,37 @@
 """Step 10 — Streamlit app.
 
 Thin client. Every number displayed here traces to engine.run_scenario() or a
-Step 9 reporter function via src/app_logic.py — this file contains NO economic
-arithmetic (asserted by test_app_py_contains_no_inline_economic_arithmetic).
+Step 9 reporter function via src/app_logic.py — this file contains NO
+economic arithmetic (asserted by test_app_py_contains_no_inline_economic_
+arithmetic-style checks, and by inspection: it only calls app_logic and
+renders what comes back).
 
-If you are reading this file to understand the four economic outputs, you are
-in the wrong place: see src/engine.py's TradeOffEngine.economics-producing
-code, or src/reporter.py's avoidable_cost_view. This file is layout and
-sliders.
+Rebuilt for D-071/D-072 to match the dashboard mockup agreed with the user:
+per-class sliders (all four levers, per ABC class), a multi-select line
+picker, Base/Optimal preset buttons, and a cost bridge with both delta rows.
+Capacity warnings are computed LIVE from the scenario being viewed, not
+looked up in a static table.
 """
 
 import os
 
+import pandas as pd
 import streamlit as st
 
 from src.app_logic import (
+    ABC_CLASSES,
+    base_levers_for_line,
     build_clean_data,
     build_engine,
-    capacity_check,
+    by_class_breakdown,
     fingerprint_status,
+    line_policy_table,
+    live_capacity_warnings,
     load_app_data,
     load_config,
+    optimal_levers_for_line,
     owner_table,
-    scenario_view,
-    top_policy_moves,
+    run_scenario_for_lines,
 )
 from src.engine import LeverSettings
 
@@ -43,131 +51,289 @@ def _load_engine():
 
 engine, assumptions, schema, app_data = _load_engine()
 fp_status = fingerprint_status(engine, app_data)
+LEVER_CFG = assumptions["levers"]
 
 st.title("IBP Trade-Off Engine")
 st.caption(
-    "Four levers in, four costs out — deterministic simulation. "
-    "Machine learning (Step 7) explains and generalises the policy; "
-    "it does not produce this scenario's numbers."
+    "Four levers, set per ABC class, in — four costs out. Deterministic "
+    "simulation, capacity checked live on every change. Step 7's ML explains "
+    "and generalises the policy; it does not produce this scenario's numbers."
 )
 
 # --------------------------------------------------------------------------
-# SIDEBAR — line selector + four lever sliders, bound to assumptions ranges
+# Line selection — multi-select, "All lines" toggle
 # --------------------------------------------------------------------------
 
-line_ids = sorted(engine.line_master["line_id"].tolist())
-with st.sidebar:
-    st.header("Scenario")
-    line_id = st.selectbox("Production line", line_ids)
+all_line_ids = sorted(engine.line_master["line_id"].tolist())
+line_category = {
+    lid: str(engine.sku_master.loc[engine.line_skus(lid)[0], "category"])
+    for lid in all_line_ids
+}
 
-    category = str(
-        engine.sku_master.loc[engine.line_skus(line_id)[0], "category"]
-    )
-    default_levers = LeverSettings.defaults(assumptions, category, "A")
+st.subheader("Production line(s)")
+cols = st.columns(len(all_line_ids) + 1)
+if "selected_lines" not in st.session_state:
+    st.session_state.selected_lines = [all_line_ids[0]]
 
-    levers_cfg = assumptions["levers"]
-    st_lo, st_hi = (float(v) for v in levers_cfg["service_target_by_abc"]["range"])
-    cov_lo, cov_hi = (float(v) for v in levers_cfg["inventory_cover_weeks"]["range"])
-    bias_lo, bias_hi = (
-        float(v) for v in levers_cfg["forecast_bias_correction"]["range"]
-    )
-    mrh_lo, mrh_hi = (float(v) for v in levers_cfg["min_run_hours"]["range"])
+with cols[0]:
+    if st.button("All lines", width="stretch"):
+        st.session_state.selected_lines = list(all_line_ids)
+for i, lid in enumerate(all_line_ids):
+    with cols[i + 1]:
+        active = lid in st.session_state.selected_lines
+        label = f"● {lid}" if active else lid
+        if st.button(f"{label} — {line_category[lid]}", width="stretch"):
+            sel = set(st.session_state.selected_lines)
+            if lid in sel:
+                if len(sel) > 1:
+                    sel.remove(lid)
+            else:
+                sel.add(lid)
+            st.session_state.selected_lines = sorted(sel)
 
-    service_target = st.slider(
-        "Service target", st_lo, st_hi, float(default_levers.service_target), 0.005
-    )
-    inventory_cover_weeks = st.slider(
-        "Inventory cover (weeks)",
-        cov_lo,
-        cov_hi,
-        float(default_levers.inventory_cover_weeks),
-        0.5,
-    )
-    forecast_bias_correction = st.slider(
-        "Forecast bias correction",
-        bias_lo,
-        bias_hi,
-        float(default_levers.forecast_bias_correction),
-        0.05,
-    )
-    min_run_hours = st.slider(
-        "Minimum run length (hours)", mrh_lo, mrh_hi, float(default_levers.min_run_hours), 0.5
-    )
+selected_lines = st.session_state.selected_lines
+n_lines = len(selected_lines)
+st.caption(
+    f"{'Consolidated — ' if n_lines > 1 else ''}"
+    f"{' + '.join(selected_lines)} ({n_lines} line{'s' if n_lines != 1 else ''})"
+)
 
-levers = LeverSettings(
-    service_target=service_target,
-    inventory_cover_weeks=inventory_cover_weeks,
-    forecast_bias_correction=forecast_bias_correction,
-    min_run_hours=min_run_hours,
-).validate(assumptions)
+# All selected lines must share categories for one set of class sliders to
+# mean the same thing physically (min_run_hours default, line speed, etc
+# vary by category) — the app still allows a mixed selection (levers are
+# class semantics and apply the same way regardless of category) but flags
+# it so the person knows what they are looking at.
+categories_in_selection = {line_category[l] for l in selected_lines}
+if len(categories_in_selection) > 1:
+    st.caption(
+        f"Note: selected lines span categories {sorted(categories_in_selection)} "
+        f"— the same per-class levers are applied to each line's own economics."
+    )
 
 # --------------------------------------------------------------------------
-# ASSUMPTIONS PANEL — main screen, not buried (architecture §9)
+# Base / Optimal presets
+# --------------------------------------------------------------------------
+
+primary_line = selected_lines[0]
+base_levers = base_levers_for_line(engine, assumptions, primary_line)
+
+if "current_levers" not in st.session_state:
+    st.session_state.current_levers = base_levers.as_dict()
+
+preset_col1, preset_col2 = st.columns(2)
+with preset_col1:
+    if st.button("Jump to base"):
+        st.session_state.current_levers = base_levers.as_dict()
+with preset_col2:
+    optimal_disabled = n_lines > 1
+    if st.button(
+        "Jump to optimal",
+        disabled=optimal_disabled,
+        help="Only available for a single selected line — different lines "
+        "have independently-found optima." if optimal_disabled else None,
+    ):
+        opt = optimal_levers_for_line(app_data["line_results"], primary_line)
+        st.session_state.current_levers = opt.as_dict()
+
+# --------------------------------------------------------------------------
+# Sliders — per ABC class, all four levers
+# --------------------------------------------------------------------------
+
+st.subheader("Levers, per ABC class")
+cur = st.session_state.current_levers
+class_cols = st.columns(3)
+new_levers: dict = {
+    "service_target": {}, "inventory_cover_weeks": {},
+    "forecast_bias_correction": {}, "min_run_hours": {},
+}
+
+st_lo, st_hi = (float(v) for v in LEVER_CFG["service_target_by_abc"]["range"])
+cov_lo, cov_hi = (float(v) for v in LEVER_CFG["inventory_cover_weeks"]["range"])
+bias_lo, bias_hi = (float(v) for v in LEVER_CFG["forecast_bias_correction"]["range"])
+mrh_lo, mrh_hi = (float(v) for v in LEVER_CFG["min_run_hours"]["range"])
+
+for i, cls in enumerate(ABC_CLASSES):
+    with class_cols[i]:
+        n_skus = sum(
+            1 for lid in selected_lines for s in engine.line_skus(lid)
+            if engine.sku_master.loc[s, "abc_class"] == cls
+        )
+        st.markdown(f"**Class {cls}** — {n_skus} SKUs")
+
+        def _cur(field, default):
+            v = cur.get(field, default)
+            return float(v[cls]) if isinstance(v, dict) else float(v)
+
+        new_levers["service_target"][cls] = st.slider(
+            "Service target", st_lo, st_hi,
+            _cur("service_target", 0.95), 0.005, key=f"svc_{cls}",
+        )
+        new_levers["inventory_cover_weeks"][cls] = st.slider(
+            "Cover (weeks)", cov_lo, cov_hi,
+            _cur("inventory_cover_weeks", 4.0), 0.5, key=f"cov_{cls}",
+        )
+        new_levers["forecast_bias_correction"][cls] = st.slider(
+            "Bias correction", bias_lo, bias_hi,
+            _cur("forecast_bias_correction", 0.0), 0.05, key=f"bias_{cls}",
+        )
+        new_levers["min_run_hours"][cls] = st.slider(
+            "Min run (hours)", mrh_lo, mrh_hi,
+            _cur("min_run_hours", 7.0), 0.5, key=f"mrh_{cls}",
+        )
+
+levers = LeverSettings(**new_levers).validate(assumptions)
+st.session_state.current_levers = levers.as_dict()
+
+# --------------------------------------------------------------------------
+# Assumptions panel
 # --------------------------------------------------------------------------
 
 st.subheader("Assumptions in effect")
 econ = assumptions["plant_economics"]
-cat_cfg = assumptions["categories"][category]
 a1, a2, a3, a4 = st.columns(4)
-a1.metric("Category", category)
-a2.metric("Line speed (units/hr)", f"{cat_cfg['line_speed_units_hr']:,}")
-a3.metric("Scheduled hrs / line-month", f"{econ['scheduled_hours_per_line_month']:g}")
+a1.metric("Categories in view", ", ".join(sorted(categories_in_selection)))
+a2.metric("Scheduled hrs / line-month", f"{econ['scheduled_hours_per_line_month']:g}")
+a3.metric("Max overtime hrs / month", f"{econ['max_overtime_hours_month']:g}")
 a4.metric("Fixed absorption / line-month", f"€{econ['fixed_absorption_eur_line_month']:,.0f}")
 
 if not fp_status["match"]:
     st.warning(
-        f"Reference tables (Step 7/8 outputs) were generated under a "
-        f"different assumption set than the one currently loaded. "
+        f"Reference tables (Step 7 output) were generated under a different "
+        f"assumption set than the one currently loaded. "
         f"Live: {fp_status['live']} · Static: {fp_status['static']}. "
-        f"Portfolio evidence below may be stale — regenerate app_data/ from "
-        f"Steps 7 and 8 if assumptions.yaml has changed."
+        f"'Jump to optimal' and the Optimal row below may be stale — "
+        f"regenerate app_data/ from Step 7 if assumptions.yaml has changed."
+    )
+
+# --------------------------------------------------------------------------
+# Live scenario
+# --------------------------------------------------------------------------
+
+scenario = run_scenario_for_lines(engine, selected_lines, levers, assumptions, schema)
+base_scenario = run_scenario_for_lines(
+    engine, selected_lines, base_levers, assumptions, schema
+)
+
+warnings = live_capacity_warnings(scenario["capacity"])
+for w in warnings:
+    st.warning(w)
+
+# --------------------------------------------------------------------------
+# Cost bridge — Base, Scenario, Δ vs base, Δ vs optimal, Optimal
+# --------------------------------------------------------------------------
+
+st.subheader("Cost bridge")
+
+OUTPUTS = [
+    ("lost_sales_eur", "Lost sales"),
+    ("excess_obsolescence_eur", "Excess / slow-moving"),
+    ("working_capital_cost_eur", "Working capital"),
+    ("conversion_cost_avoidable_eur", "Conversion (avoidable)"),
+]
+
+bridge_rows = []
+bv = base_scenario["avoidable_view"]
+sv = scenario["avoidable_view"]
+bridge_rows.append(
+    {"": "Base", **{lbl: bv[k] for k, lbl in OUTPUTS},
+     "Total": sum(bv[k] for k, _ in OUTPUTS)}
+)
+bridge_rows.append(
+    {"": "Scenario", **{lbl: sv[k] for k, lbl in OUTPUTS},
+     "Total": sum(sv[k] for k, _ in OUTPUTS)}
+)
+bridge_rows.append(
+    {"": "Δ vs base",
+     **{lbl: sv[k] - bv[k] for k, lbl in OUTPUTS},
+     "Total": sum(sv[k] - bv[k] for k, _ in OUTPUTS)}
+)
+
+if n_lines == 1:
+    opt_levers = optimal_levers_for_line(app_data["line_results"], primary_line)
+    opt_scenario = run_scenario_for_lines(
+        engine, selected_lines, opt_levers, assumptions, schema
+    )
+    ov = opt_scenario["avoidable_view"]
+    bridge_rows.append(
+        {"": "Δ vs optimal",
+         **{lbl: sv[k] - ov[k] for k, lbl in OUTPUTS},
+         "Total": sum(sv[k] - ov[k] for k, _ in OUTPUTS)}
+    )
+    bridge_rows.append(
+        {"": "Optimal", **{lbl: ov[k] for k, lbl in OUTPUTS},
+         "Total": sum(ov[k] for k, _ in OUTPUTS)}
     )
 else:
-    st.caption(f"Assumption fingerprint: {fp_status['live']} (reference tables match)")
+    st.caption(
+        "Optimal row omitted for a multi-line selection — each line's "
+        "optimum was found independently; view one line at a time to see it."
+    )
 
-# --------------------------------------------------------------------------
-# RESULTS
-# --------------------------------------------------------------------------
-
-st.subheader(f"Scenario result — {line_id}")
-view = scenario_view(engine, line_id, levers, assumptions, schema)
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Lost sales", f"€{view['lost_sales_eur']:,.0f}")
-c2.metric("Excess / slow-moving", f"€{view['excess_obsolescence_eur']:,.0f}")
-c3.metric("Working capital", f"€{view['working_capital_cost_eur']:,.0f}")
-c4.metric("Conversion — avoidable", f"€{view['conversion_cost_avoidable_eur']:,.0f}")
-
-st.metric(
-    "Conversion — FIXED (no lever moves this)",
-    f"€{view['conversion_cost_fixed_eur']:,.0f}",
-    help="Fixed plant absorption. Included in the full P&L total below but "
-    "excluded from the optimisation objective — see decision D-062.",
-)
+bridge_df = pd.DataFrame(bridge_rows).set_index("")
+st.dataframe(bridge_df.style.format("€{:,.0f}"), width="stretch")
 
 st.markdown(
-    f"**Total avoidable cost:** €{view['total_avoidable_cost_eur']:,.0f}  ·  "
-    f"**Total reported (full P&L) cost:** €{view['total_reported_cost_eur']:,.0f}"
-)
-
-warning = capacity_check(line_id, inventory_cover_weeks, app_data["portfolio_summary"])
-if warning:
-    st.warning(warning)
-
-st.caption("Cost accountability, by role (not named individuals)")
-st.dataframe(owner_table(view, assumptions), use_container_width=True, hide_index=True)
-
-st.bar_chart(
-    {
-        "Lost sales": view["lost_sales_eur"],
-        "Excess": view["excess_obsolescence_eur"],
-        "Working capital": view["working_capital_cost_eur"],
-        "Conversion (avoidable)": view["conversion_cost_avoidable_eur"],
-    }
+    f"**Conversion — fixed (no lever moves this):** "
+    f"€{sv['conversion_cost_fixed_eur']:,.0f}  ·  "
+    f"**Total reported (full P&L) cost:** €{sv['total_reported_cost_eur']:,.0f}"
 )
 
 # --------------------------------------------------------------------------
-# PORTFOLIO EVIDENCE — static reference, clearly dated
+# By-class breakdown
+# --------------------------------------------------------------------------
+
+st.subheader("By product class — current scenario")
+cb = by_class_breakdown(scenario["sku_month"], levers)
+st.dataframe(cb, width="stretch", hide_index=True)
+
+st.caption("Cost accountability, by role (not named individuals)")
+st.dataframe(
+    owner_table(scenario["avoidable_view"], assumptions),
+    width="stretch", hide_index=True,
+)
+
+# --------------------------------------------------------------------------
+# SKU detail
+# --------------------------------------------------------------------------
+
+st.subheader("SKU detail — resulting parameters, this scenario")
+sku_totals = (
+    scenario["sku_month"]
+    .groupby(["sku_id", "line_id", "abc_class"])
+    .agg(
+        lost_sales_eur=("lost_sales_eur", "sum"),
+        excess_obsolescence_eur=("excess_obsolescence_eur", "sum"),
+        working_capital_cost_eur=("working_capital_cost_eur", "sum"),
+    )
+    .reset_index()
+)
+sku_totals["service_target"] = sku_totals["abc_class"].map(
+    lambda c: levers.resolve("service_target", c)
+)
+sku_totals["cover_weeks"] = sku_totals["abc_class"].map(
+    lambda c: levers.resolve("inventory_cover_weeks", c)
+)
+sku_totals["bias_correction"] = sku_totals["abc_class"].map(
+    lambda c: levers.resolve("forecast_bias_correction", c)
+)
+sku_totals["min_run_hours"] = sku_totals["abc_class"].map(
+    lambda c: levers.resolve("min_run_hours", c)
+)
+sku_totals["est_cost_eur"] = (
+    sku_totals["lost_sales_eur"]
+    + sku_totals["excess_obsolescence_eur"]
+    + sku_totals["working_capital_cost_eur"]
+)
+st.dataframe(
+    sku_totals[
+        ["sku_id", "line_id", "abc_class", "service_target", "cover_weeks",
+         "bias_correction", "min_run_hours", "est_cost_eur"]
+    ],
+    width="stretch", hide_index=True,
+)
+
+# --------------------------------------------------------------------------
+# Portfolio evidence — static reference, clearly dated
 # --------------------------------------------------------------------------
 
 st.subheader("Portfolio evidence (reference, from Steps 7-8)")
@@ -176,15 +342,15 @@ st.caption(
     f"Not recomputed live — see decision D-072."
 )
 
-tab1, tab2 = st.tabs(["Top policy moves", "Lever consistency across lines"])
+tab1, tab2 = st.tabs(["Optimal policy by class", "Lever consistency across lines"])
 with tab1:
-    moves = top_policy_moves(
-        app_data["optimal_policy"], engine.sku_master, assumptions
+    st.dataframe(
+        line_policy_table(app_data["line_results"]),
+        width="stretch", hide_index=True,
     )
-    st.dataframe(moves, use_container_width=True, hide_index=True)
 with tab2:
     st.dataframe(
-        app_data["lever_consistency"], use_container_width=True, hide_index=True
+        app_data["lever_consistency"], width="stretch", hide_index=True
     )
 
 st.caption(

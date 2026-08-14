@@ -1,0 +1,181 @@
+SNAKE PROMPT — STEP 10 REDO, PER-CLASS DASHBOARD
+IBP Trade-Off Engine · Week 6 Capstone · AI Finance Accelerator
+
+Rebuilds the Streamlit app against D-071's per-class engine and D-072's
+Step 9 reporter functions, matching the dashboard mockup validated with the
+user in-chat before any Streamlit code was touched (avoiding slow-redeploy
+layout iteration). Retracts nothing new — this consumes Step 7/9's already-
+verified output; no economic logic changes here.
+
+
+-------------------------------------------------------------------------------
+S — SPECIFY FILE TYPE AND DATA SOURCE
+-------------------------------------------------------------------------------
+
+Modified: src/app_logic.py, app.py, tests/test_app_logic.py
+New app_data/ artefacts: line_results.csv (search_all_lines() output),
+  sku_level.csv (expand_to_sku_level() output) — replace the retired
+  optimal_policy.csv, which is deleted.
+Unmodified: src/engine.py, src/policy_model.py, src/reporter.py — all
+  consumed, none extended.
+
+
+-------------------------------------------------------------------------------
+N — NOTE THE ENVIRONMENT
+-------------------------------------------------------------------------------
+
+Streamlit Cloud. Same read-only-repo constraint as before (D-072's
+predecessor decision) — build_clean_data() already writes to a temp
+directory, unchanged, still correct.
+
+Verified with streamlit.testing.v1.AppTest, which executes app.py directly
+and inspects for real exceptions and real widget state — not inferred from
+HTTP status or log absence. Also verified under an actual read-only bind
+mount (not just chmod, which does not bind on a root-run sandbox) to
+reproduce Streamlit Cloud's exact failure mode from the first deploy attempt.
+
+
+-------------------------------------------------------------------------------
+A — ACTION TO PERFORM
+-------------------------------------------------------------------------------
+
+In src/app_logic.py — full rewrite, no `import streamlit`:
+
+  base_levers_for_line(engine, assumptions, line_id) -> LeverSettings
+      TRUE per-class default (LeverSettings.defaults_per_class()) — each
+      class at its OWN default, not class A applied to everyone. This is
+      what "Base" means now, matching Step 7/9's redefinition.
+
+  optimal_levers_for_line(line_results, line_id) -> LeverSettings
+      Reads the committed, capacity-verified optimum for ONE line. Not
+      generalised to multi-line — different lines have independently-found
+      optima, so the app disables "jump to optimal" when more than one line
+      is selected rather than picking one arbitrarily.
+
+  run_scenario_for_lines(engine, line_ids, levers, assumptions, schema) -> dict
+      THE core function. Runs ONE per-class LeverSettings across every
+      selected line — genuinely live, not cached or precomputed. Returns the
+      combined avoidable-cost view (summed across lines, since SKUs never
+      overlap between lines), the concatenated per-SKU sku_month, and a
+      per-line capacity read.
+
+  live_capacity_warnings(capacity_df) -> list[str]
+      Computed from the scenario JUST run, not a static Step 8 lookup — the
+      whole reason this module was rebuilt. A line is flagged only if the
+      exact combination of levers currently on screen produced a real
+      shortfall.
+
+  by_class_breakdown(sku_month, levers) -> pd.DataFrame
+      Aggregates sku_month (which arrives as one row per SKU PER MONTH) to
+      one row per SKU first, THEN groups by class — a coarser aggregation
+      would count SKU-months as SKUs. Conversion cost is not split per class
+      (D-066); shown as pd.NA in this table, not fabricated.
+
+  owner_table, line_policy_table: thin wrappers around src.reporter's
+  equivalents, unchanged in spirit from the prior app_logic.
+
+In app.py:
+
+  Multi-select line picker (button-pills, not a dropdown) — "All lines" plus
+  one button per line, toggle behaviour matching the validated mockup.
+
+  "Jump to base" / "Jump to optimal" buttons set every slider via
+  st.session_state, then the normal slider flow resumes on the next
+  interaction — not a locked preset.
+
+  Twelve sliders: one card per ABC class (A/B/C), four levers each
+  (service_target, inventory_cover_weeks, forecast_bias_correction,
+  min_run_hours), all bounds read from assumptions.levers.*.range.
+
+  Cost bridge as a table: Base, Scenario, Δ vs base, and — only when exactly
+  one line is selected — Δ vs optimal and Optimal. The optimal row is
+  omitted, not faked, for a multi-line selection, with a caption explaining
+  why (each line's optimum was found independently).
+
+  Live capacity warnings shown as st.warning banners, computed on every
+  rerun from whatever levers are currently set.
+
+  By-class breakdown table, owner table, SKU detail table (one row per SKU,
+  every column derived from the live scenario or the current lever values —
+  no static data).
+
+  Portfolio evidence section at the bottom: Step 7's line_policy_table and
+  Step 8's lever-consistency table, both clearly labelled as reference,
+  dated by their assumption fingerprint, not live.
+
+TESTS — tests/test_app_logic.py, full rewrite:
+
+  test_no_streamlit_import_in_app_logic
+  test_build_clean_data_never_writes_inside_repo_root (regression)
+  test_base_levers_are_true_per_class_defaults
+  test_base_levers_are_not_class_a_applied_to_everyone
+      the retired convention must not silently resurface
+  test_optimal_levers_come_from_committed_line_results
+  test_optimal_levers_raise_for_unknown_line
+  test_fingerprint_mismatch_is_detected
+  test_single_line_matches_direct_engine_and_reporter_call
+  test_multi_line_sums_two_independent_single_line_calls
+  test_run_scenario_raises_with_no_lines
+  test_scenario_view_does_not_reimplement_economics
+  test_capacity_warnings_are_live_not_static
+      THE test. Same lever settings that are calm on one line and stressed
+      on another must produce warnings that track the ACTUAL scenario just
+      run, not a canned lookup.
+  test_capacity_warning_names_the_breaching_line_in_multiline
+  test_by_class_breakdown_counts_skus_not_sku_months
+      regression for the SKU-vs-SKU-month aggregation bug found during build
+  test_by_class_breakdown_does_not_fabricate_conversion
+  test_owner_table_matches_direct_reporter_call
+  test_line_policy_table_has_one_row_per_class
+  test_ground_truth_not_importable
+
+Additionally verified, beyond pytest, because HTTP 200 alone does not prove a
+script executed cleanly:
+  - streamlit.testing.v1.AppTest.run() with zero exceptions, correct widget
+    counts (12 sliders, 7 buttons, 6 dataframes)
+  - simulated interaction: line-switch via button click, slider value
+    changes via .set_value(), confirmed the capacity warning fires on L2
+    under a stress scenario and stays silent on L1 under the same scenario
+  - a genuine read-only bind mount (not chmod, which a root-run sandbox
+    ignores) reproducing Streamlit Cloud's exact deploy condition — clean
+    run, same widget counts, zero exceptions
+
+
+-------------------------------------------------------------------------------
+K — KEY DATA STRUCTURE
+-------------------------------------------------------------------------------
+
+app_data/line_results.csv — search_all_lines() output, now carrying
+assumption_fingerprint for the app's staleness check:
+
+  line_id  cover_A  cover_B  cover_C  service_A  service_B  service_C  ...  assumption_fingerprint
+  L3       5.5      5.5      1.0      0.88       0.88       0.995      ...  v0.1:...
+
+app_data/sku_level.csv — expand_to_sku_level() output, one row per SKU.
+
+run_scenario_for_lines() return value:
+
+  {
+    "avoidable_view": {... combined across selected lines ...},
+    "sku_month": <concatenated DataFrame, one row per SKU per month per line>,
+    "capacity": <DataFrame, one row per selected line, workload/shortfall>,
+  }
+
+
+-------------------------------------------------------------------------------
+E — EXTRA DETAILS
+-------------------------------------------------------------------------------
+
+- No economic arithmetic in app.py — every number traces to engine.
+  run_scenario() or a Step 9 reporter function via app_logic.
+- No hard-coded line ids, SKU ids, or lever ranges anywhere.
+- app_data/optimal_policy.csv is deleted, not left stale alongside the new
+  files.
+- Verification method matters as much as the result here: HTTP 200 and an
+  empty terminal log are NOT sufficient evidence a Streamlit script ran
+  without error — use AppTest, and test under a real read-only mount, not
+  chmod, when checking anything related to the deploy environment.
+- Nothing is final until it has been deployed on Streamlit Cloud from the
+  reviewer's own push (D-037's principle, applied to this step: sandbox
+  AppTest verification is strong evidence, the actual Streamlit Cloud deploy
+  is the real confirmation).

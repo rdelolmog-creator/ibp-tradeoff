@@ -9,11 +9,11 @@ inventory_cover_weeks,excess_obsolescence_eur,False,up,up,up,flat
 inventory_cover_weeks,conversion_cost_eur,True,up,up,up,up
 inventory_cover_weeks,working_capital_cost_eur,True,up,up,up,up
 inventory_cover_weeks,total_economic_cost_eur,False,down,up,down,down
-forecast_bias_correction,lost_sales_eur,True,up,up,up,up
+forecast_bias_correction,lost_sales_eur,False,up,down,up,up
 forecast_bias_correction,excess_obsolescence_eur,True,flat,flat,flat,flat
-forecast_bias_correction,conversion_cost_eur,True,down,down,down,down
-forecast_bias_correction,working_capital_cost_eur,True,down,down,down,down
-forecast_bias_correction,total_economic_cost_eur,True,up,up,up,up
+forecast_bias_correction,conversion_cost_eur,False,down,up,down,down
+forecast_bias_correction,working_capital_cost_eur,False,up,up,down,down
+forecast_bias_correction,total_economic_cost_eur,False,up,down,up,up
 min_run_hours,lost_sales_eur,True,down,down,down,down
 min_run_hours,excess_obsolescence_eur,True,up,up,up,up
 min_run_hours,conversion_cost_eur,True,down,down,down,down

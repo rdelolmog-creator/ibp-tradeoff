@@ -566,6 +566,7 @@ def search_all_lines(
         row = best.to_dict()
         row["default_total_cost_eur"] = default_total
         row["saving_eur"] = default_total - best["total_economic_cost_eur"]
+        row["assumption_fingerprint"] = engine.assumption_fingerprint
         rows.append(row)
 
     if not rows:

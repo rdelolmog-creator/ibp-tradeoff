@@ -1,5 +1,5 @@
 line_id,best_total_cost_eur,best_service_target,best_inventory_cover_weeks,best_forecast_bias_correction,best_min_run_hours,worst_case_utilisation_max,worst_case_overtime_hours,any_capacity_breach,interior_optimum_service_target,interior_optimum_inventory_cover_weeks,interior_optimum_forecast_bias_correction,interior_optimum_min_run_hours
-L1,4011847.9858544148,0.995,4.0,0.0,2.0,0.640048930620376,0.0,False,False,True,False,False
-L2,4524239.905365695,0.995,4.0,1.0,2.0,1.153846153846154,720.0,True,False,True,False,False
-L3,4296995.593734056,0.995,4.0,0.0,8.0,0.7052238073570226,0.0,False,False,True,False,True
-L4,4076706.034515396,0.995,4.0,0.0,8.0,0.6453951628223978,0.0,False,False,True,False,True
+L1,4014649.89320489,0.88,5.5,1.0,2.0,0.6400489324687927,0.0,False,False,True,False,False
+L2,4485915.715305358,0.88,5.5,1.0,2.0,1.153846153846154,720.0,True,False,True,False,False
+L3,4291599.751722895,0.88,5.5,1.0,11.0,0.7486738799208077,0.0,False,False,True,False,True
+L4,4081528.7339998106,0.88,5.5,1.0,2.0,0.6409827778825182,0.0,False,False,True,False,False

@@ -339,5 +339,18 @@ DECISION: `policy_brief()` is removed and replaced by two functions that match w
 
 **Known, deliberate, temporary breakage:** `src/app_logic.py` still imports the retired `policy_brief`, so `tests/test_app_logic.py` fails at collection and `app.py` would not run. Left broken on purpose rather than shallow-patched: `app_logic.py`'s `top_policy_moves()`, the committed `app_data/optimal_policy.csv` contract, and the fingerprint check all need to change together as part of Step 10's already-planned full rebuild (new sliders, new bridge, new `app_data` shape) — patching the import alone now would produce a shallow fix thrown away within the same work session. `tests/test_app_logic.py` is excluded from the "all tests pass" claim until Step 10 lands; every other suite (114 tests across engine, policy_model, portfolio_sweep, reporter, pipeline) passes.
 
+**D-073 · Step 10 rebuilt against the real per-class engine and Step 9's reporter — verified beyond HTTP 200**
+DECISION: `app.py`/`src/app_logic.py` fully rewritten to match the dashboard mockup agreed with the user before any Streamlit code was touched. Twelve sliders (four levers x three ABC classes), a multi-select line picker, Base/Optimal preset buttons, a cost bridge with both delta rows, and — the substantive change — capacity warnings computed LIVE from the scenario actually being viewed (`run_scenario_for_lines()` + `live_capacity_warnings()`), not looked up in a static Step 8 table as the retired design did.
+
+**"Base" is redefined to match D-072**: each class at its own true default (`LeverSettings.defaults_per_class()`), not class A applied to the whole line. A dedicated test (`test_base_levers_are_not_class_a_applied_to_everyone`) exists specifically to stop the old convention resurfacing silently.
+
+**Two real bugs found and fixed during this build**, same discipline as every prior step:
+1. `by_class_breakdown()`'s first draft passed the engine's raw `sku_month` (one row per SKU **per month**) straight into `class_breakdown_view()`'s groupby, which would have counted SKU-months as SKUs. Fixed by summing to one row per SKU first.
+2. The same function initially had no `cover_weeks`/`service_target` columns at all — `class_breakdown_view()` needs them but the engine's `sku_month` doesn't carry the lever value itself, only its effects. Fixed by deriving them from the current `LeverSettings` via `levers.resolve()` before aggregation.
+
+**Verification method upgraded, not just repeated.** `HTTP 200` and an empty terminal log — the standard used for the first two app.py builds — do NOT prove a Streamlit script executed without error; Streamlit can serve 200 while showing an error boundary client-side. This build was verified with `streamlit.testing.v1.AppTest`, which executes the script directly and exposes real exceptions and real widget state (confirmed: 12 sliders, 7 buttons, 6 dataframes, zero exceptions), plus simulated interaction (button clicks, `.set_value()` on sliders) confirming the capacity warning fires on L2 under stress and stays silent on L1 under the identical stress — proving the live capacity check is genuinely live, not coincidentally correct. Also re-verified under a genuine read-only bind mount (not `chmod`, which a root-run sandbox ignores and would have given a false pass) to reproduce Streamlit Cloud's exact deploy condition from the first failed attempt.
+
+`app_data/optimal_policy.csv` is deleted (superseded by `line_results.csv` + `sku_level.csv`, matching Step 7/9's real output shape). 132/132 tests pass across every module — the `test_app_logic.py` collection failure noted as a known gap in D-072 is now closed.
+
 
 *(pending)*
