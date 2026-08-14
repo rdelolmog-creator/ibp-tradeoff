@@ -27,7 +27,8 @@ from src.reporter import (  # noqa: E402
     capacity_warning,
     export_artefacts,
     owner_view,
-    policy_brief,
+    line_policy_brief,
+    class_breakdown_view,
     portfolio_brief,
     require_artefact,
 )
@@ -240,54 +241,75 @@ def test_present_artefact_passes_through(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# policy_brief / portfolio_brief
+# line_policy_brief / class_breakdown_view / portfolio_brief
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def toy_optimal_policy():
+def toy_line_results():
+    """One row per line — the search_all_lines() output shape."""
     return pd.DataFrame(
         {
-            "sku_id": ["S1", "S2", "S3"],
-            "line_id": ["L1", "L1", "L2"],
-            "optimal_cover_weeks": [2.0, 6.0, 1.0],
-            "optimal_service_target": [0.9, 0.99, 0.88],
-            "saving_eur": [500.0, 5000.0, 50.0],
+            "line_id": ["L1", "L2"],
+            "cover_A": [3.5, 2.0], "cover_B": [2.5, 4.0], "cover_C": [1.5, 6.0],
+            "service_A": [0.995, 0.96], "service_B": [0.95, 0.94], "service_C": [0.88, 0.90],
+            "total_economic_cost_eur": [380000.0, 500000.0],
+            "default_total_cost_eur": [409000.0, 550000.0],
+            "saving_eur": [29000.0, 50000.0],
         }
     )
 
 
 @pytest.fixture
-def toy_sku_master():
+def toy_sku_level():
+    """The expand_to_sku_level() output shape."""
     return pd.DataFrame(
         {
-            "sku_id": ["S1", "S2", "S3"],
-            "category": ["ambient", "ambient", "chilled"],
-            "abc_class": ["A", "B", "C"],
+            "sku_id": ["S1", "S2", "S3", "S4"],
+            "line_id": ["L1", "L1", "L1", "L2"],
+            "abc_class": ["A", "B", "C", "A"],
+            "cover_weeks": [3.5, 2.5, 1.5, 2.0],
+            "service_target": [0.995, 0.95, 0.88, 0.96],
+            "lost_sales_eur": [100.0, 200.0, 300.0, 150.0],
+            "excess_obsolescence_eur": [50.0, 80.0, 400.0, 60.0],
+            "working_capital_cost_eur": [70.0, 90.0, 60.0, 40.0],
+            "line_conversion_cost_eur": [160000.0, 160000.0, 160000.0, 200000.0],
         }
-    ).set_index("sku_id")
+    )
 
 
-@pytest.fixture
-def toy_defaults():
-    return {
-        "A": {"inventory_cover_weeks": 4.0, "service_target": 0.985},
-        "B": {"inventory_cover_weeks": 4.0, "service_target": 0.96},
-        "C": {"inventory_cover_weeks": 6.0, "service_target": 0.93},
-    }
+def test_line_policy_brief_has_one_row_per_line_per_class(toy_line_results):
+    lpb = line_policy_brief(toy_line_results)
+    assert len(lpb) == len(toy_line_results) * 3
+    assert set(lpb["abc_class"]) == {"A", "B", "C"}
 
 
-def test_policy_brief_sorted_by_saving_descending(
-    toy_optimal_policy, toy_sku_master, toy_defaults
+def test_line_policy_brief_carries_the_lines_own_saving_not_a_per_sku_one(
+    toy_line_results,
 ):
-    pb = policy_brief(toy_optimal_policy, toy_sku_master, toy_defaults, top_n=3)
-    assert list(pb["saving_eur"]) == sorted(pb["saving_eur"], reverse=True)
-    assert pb.iloc[0]["sku_id"] == "S2"
+    """Saving is a LINE fact now — every class row for a line shows the SAME
+    line_saving_eur, because attributing it per class/SKU was exactly the
+    unverified assumption D-071 retracted."""
+    lpb = line_policy_brief(toy_line_results)
+    l1_savings = lpb[lpb.line_id == "L1"]["line_saving_eur"]
+    assert l1_savings.nunique() == 1
+    assert float(l1_savings.iloc[0]) == 29000.0
 
 
-def test_policy_brief_respects_top_n(toy_optimal_policy, toy_sku_master, toy_defaults):
-    pb = policy_brief(toy_optimal_policy, toy_sku_master, toy_defaults, top_n=2)
-    assert len(pb) == 2
+def test_class_breakdown_sums_real_sku_level_costs(toy_sku_level):
+    cb = class_breakdown_view(toy_sku_level)
+    l1_a = cb[(cb.line_id == "L1") & (cb.abc_class == "A")].iloc[0]
+    assert l1_a["lost_sales_eur"] == 100.0
+    assert l1_a["n_skus"] == 1
+
+
+def test_class_breakdown_does_not_split_conversion_per_class(toy_sku_level):
+    """D-066 still holds: conversion is not separable per class. It must
+    appear identically across every class row for a line, not be divided."""
+    cb = class_breakdown_view(toy_sku_level)
+    l1_conv = cb[cb.line_id == "L1"]["line_conversion_cost_eur"]
+    assert l1_conv.nunique() == 1
+    assert float(l1_conv.iloc[0]) == 160000.0
 
 
 def test_portfolio_brief_mentions_breaching_line():
@@ -313,18 +335,18 @@ def test_portfolio_brief_mentions_breaching_line():
 
 
 def test_export_writes_expected_files(
-    scenario_result, assumptions, schema, toy_optimal_policy, toy_sku_master,
-    toy_defaults, tmp_path
+    scenario_result, assumptions, schema, toy_line_results, toy_sku_level, tmp_path
 ):
     av = avoidable_cost_view(scenario_result, assumptions, schema)
-    pb = policy_brief(toy_optimal_policy, toy_sku_master, toy_defaults)
+    lpb = line_policy_brief(toy_line_results)
+    cb = class_breakdown_view(toy_sku_level)
     brief = portfolio_brief(
         pd.DataFrame([{"line_id": "L1", "any_capacity_breach": False,
                        "worst_case_utilisation_max": 0.6,
                        "worst_case_overtime_hours": 0.0}]),
         pd.DataFrame([{"lever": "x", "output": "y", "consistent": True}]),
     )
-    paths = export_artefacts(av, pb, brief, str(tmp_path))
+    paths = export_artefacts(av, lpb, cb, brief, str(tmp_path))
     for p in paths.values():
         assert os.path.isfile(p)
 

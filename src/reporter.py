@@ -24,7 +24,7 @@ chat, all decisions already made and logged before this step was written:
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -218,50 +218,71 @@ def owner_view(
 # ---------------------------------------------------------------------------
 
 
-def policy_brief(
-    optimal_policy: pd.DataFrame,
-    sku_master: pd.DataFrame,
-    default_levers_by_class: Dict[str, Dict[str, float]],
-    top_n: int = 10,
-) -> pd.DataFrame:
-    """The SKUs with the largest saving_eur, joined to category/ABC class,
-    with current (class default) vs optimal cover and service shown side by
-    side. Step 7 produced the optimum; this makes it the "what do I actually
-    change" artefact a planner can act on without reading a notebook.
+def line_policy_brief(line_results: pd.DataFrame) -> pd.DataFrame:
+    """The 'what do I actually set' table, one row per (line, class).
+
+    D-071 replaces this entirely: the old policy_brief ranked SKUs by their
+    own saving_eur, a per-SKU quantity that no longer has a well-defined
+    meaning — that was exactly the unverified assumption Step 7's redo
+    retracted (moving one SKU's policy in isolation while every other SKU
+    stayed at default was never actually simulated). Saving is now a
+    LINE-level fact: default_total_cost_eur minus the winning
+    total_economic_cost_eur for that line's jointly-feasible policy.
+
+    This function flattens search_all_lines()' one-row-per-line output into
+    one row per (line, class) — directly actionable, and it does not invent
+    a per-SKU or per-class saving attribution that isn't there.
     """
-    sm = sku_master.copy()
-    if sm.index.name != "sku_id":
-        sm = sm.set_index("sku_id")
+    rows: List[Dict[str, Any]] = []
+    for _, r in line_results.iterrows():
+        for cls in ("A", "B", "C"):
+            rows.append(
+                {
+                    "line_id": r["line_id"],
+                    "abc_class": cls,
+                    "cover_weeks": float(r[f"cover_{cls}"]),
+                    "service_target": float(r[f"service_{cls}"]),
+                    "line_total_cost_eur": float(r["total_economic_cost_eur"]),
+                    "line_default_cost_eur": float(r["default_total_cost_eur"]),
+                    "line_saving_eur": float(r["saving_eur"]),
+                }
+            )
+    return pd.DataFrame(rows)
 
-    pol = optimal_policy.sort_values("saving_eur", ascending=False).head(top_n).copy()
-    pol["category"] = pol["sku_id"].map(sm["category"])
-    pol["abc_class"] = pol["sku_id"].map(sm["abc_class"])
 
-    def _current(row: pd.Series, field: str) -> float:
-        cls = row["abc_class"]
-        return float(default_levers_by_class.get(cls, {}).get(field, float("nan")))
+def class_breakdown_view(sku_level: pd.DataFrame) -> pd.DataFrame:
+    """Real per-class economics for the current jointly-optimal scenario —
+    the 'where does the trade-off actually land' table the dashboard mockup
+    validated, built honestly this time.
 
-    pol["current_cover_weeks"] = pol.apply(
-        lambda r: _current(r, "inventory_cover_weeks"), axis=1
+    lost_sales / excess / working_capital are genuinely summed from
+    expand_to_sku_level()'s per-SKU rows, which themselves come from the one
+    real joint simulation that produced the winning policy — not an
+    illustrative or fabricated split. Conversion cost is NOT divided across
+    classes: D-066's finding that it is not separable per SKU still holds, so
+    it is shown once per line, unsplit, rather than manufacturing a
+    plausible-looking number this project has already found to be
+    misleading when done the other way.
+    """
+    agg = (
+        sku_level.groupby(["line_id", "abc_class"])
+        .agg(
+            n_skus=("sku_id", "count"),
+            cover_weeks=("cover_weeks", "first"),
+            service_target=("service_target", "first"),
+            lost_sales_eur=("lost_sales_eur", "sum"),
+            excess_obsolescence_eur=("excess_obsolescence_eur", "sum"),
+            working_capital_cost_eur=("working_capital_cost_eur", "sum"),
+            line_conversion_cost_eur=("line_conversion_cost_eur", "first"),
+        )
+        .reset_index()
     )
-    pol["current_service_target"] = pol.apply(
-        lambda r: _current(r, "service_target"), axis=1
+    agg["separable_subtotal_eur"] = (
+        agg["lost_sales_eur"]
+        + agg["excess_obsolescence_eur"]
+        + agg["working_capital_cost_eur"]
     )
-
-    out = pol[
-        [
-            "sku_id",
-            "line_id",
-            "category",
-            "abc_class",
-            "current_cover_weeks",
-            "optimal_cover_weeks",
-            "current_service_target",
-            "optimal_service_target",
-            "saving_eur",
-        ]
-    ].reset_index(drop=True)
-    return out
+    return agg
 
 
 # ---------------------------------------------------------------------------
@@ -328,11 +349,12 @@ def portfolio_brief(
 
 def export_artefacts(
     avoidable_view: Dict[str, float],
-    policy_brief_df: pd.DataFrame,
+    line_policy_brief_df: pd.DataFrame,
+    class_breakdown_df: pd.DataFrame,
     portfolio_brief_text: str,
     out_dir: str,
 ) -> Dict[str, str]:
-    """Write the three reporter artefacts. No plotting dependency — Step 10
+    """Write the reporter artefacts. No plotting dependency — Step 10
     (Streamlit) owns visualisation; this module owns the numbers."""
     os.makedirs(out_dir, exist_ok=True)
     paths: Dict[str, str] = {}
@@ -341,13 +363,17 @@ def export_artefacts(
     pd.DataFrame([avoidable_view]).to_csv(p1, index=False)
     paths["avoidable_cost_summary"] = p1
 
-    p2 = os.path.join(out_dir, "policy_brief.csv")
-    policy_brief_df.to_csv(p2, index=False)
-    paths["policy_brief"] = p2
+    p2 = os.path.join(out_dir, "line_policy_brief.csv")
+    line_policy_brief_df.to_csv(p2, index=False)
+    paths["line_policy_brief"] = p2
 
-    p3 = os.path.join(out_dir, "portfolio_brief.txt")
-    with open(p3, "w") as f:
+    p3 = os.path.join(out_dir, "class_breakdown.csv")
+    class_breakdown_df.to_csv(p3, index=False)
+    paths["class_breakdown"] = p3
+
+    p4 = os.path.join(out_dir, "portfolio_brief.txt")
+    with open(p4, "w") as f:
         f.write(portfolio_brief_text)
-    paths["portfolio_brief"] = p3
+    paths["portfolio_brief"] = p4
 
     return paths
