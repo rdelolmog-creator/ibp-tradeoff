@@ -1,0 +1,177 @@
+SNAKE PROMPT — STEP 6 REVISION, PER-CLASS LEVERS
+IBP Trade-Off Engine · Week 6 Capstone · AI Finance Accelerator
+
+Redesign of src/engine.py per D-071. Retracts the joint-capacity claim behind
+D-068's €622,610 saving figure: that number came from stitching together
+separate uniform-line simulations, never a real combined policy. This prompt
+fixes the engine so "optimal" can mean what it says — a single, jointly
+simulated, capacity-checked scenario.
+
+Not a rewrite. simulate()'s per-SKU production/shipment/capacity math already
+runs per SKU each month; only the LEVER LOOKUP becomes class-aware.
+
+
+-------------------------------------------------------------------------------
+S — SPECIFY FILE TYPE AND DATA SOURCE
+-------------------------------------------------------------------------------
+
+Modified: src/engine.py, tests/test_engine.py
+Unmodified: src/policy_model.py, src/portfolio_sweep.py, src/reporter.py,
+            app.py, src/app_logic.py — all consume the revised engine but are
+            NOT touched by this prompt. Step 7's redo, and the Step 9/10
+            follow-on changes, are separate prompts built after this one lands
+            and passes its own tests.
+
+No new data inputs. Same pipeline artefacts as every prior Step 6 revision.
+
+
+-------------------------------------------------------------------------------
+N — NOTE THE ENVIRONMENT
+-------------------------------------------------------------------------------
+
+Built and tested in this sandbox against the real repo on branch
+engine-per-class-levers, then run in Colab by the user per D-037 before being
+trusted. Same dependencies as before — pandas, numpy, pyyaml only.
+
+
+-------------------------------------------------------------------------------
+A — ACTION TO PERFORM
+-------------------------------------------------------------------------------
+
+CHANGE 1 — LeverSettings accepts per-class values for all four levers
+------------------------------------------------------------------------
+Each of service_target, inventory_cover_weeks, forecast_bias_correction,
+min_run_hours may be EITHER a single float (today's behaviour, unchanged) OR
+a dict {"A": x, "B": y, "C": z}. Add:
+
+    def resolve(self, field: str, abc_class: str) -> float
+        Returns the scalar if the field is a float, else the class's entry
+        from the dict. Raises EngineViolation if abc_class is missing from a
+        dict-valued field — no silent fallback to a default.
+
+    def validate(self, assumptions) -> "LeverSettings"
+        For each of the four fields, validate EVERY resolved value (all three
+        classes if a dict, the single value if a float) against
+        assumptions.levers.*.range. A per-class value out of range must raise,
+        exactly as a scalar out of range already does.
+
+    @classmethod
+    def defaults_per_class(cls, assumptions, category) -> "LeverSettings"
+        Builds a per-class dict for all four fields from assumptions.abc.<A|B|C>
+        and assumptions.categories.<category>.min_run_hours (same default for
+        every class unless assumptions declares otherwise — do not invent a
+        per-class min-run default that doesn't exist in config).
+        The existing defaults() classmethod (single abc_class, scalar output)
+        is UNCHANGED and stays in place — Step 8's uniform-line sweep depends
+        on it and must keep working exactly as before.
+
+    def replace(self, **kwargs) -> "LeverSettings"
+        Unchanged in signature; must accept either scalars or dicts for any
+        field being replaced.
+
+
+CHANGE 2 — simulate() looks up each SKU's own class value
+-------------------------------------------------------------
+Inside the existing per-SKU-per-month loop, replace the single scalar reads
+of levers.service_target / .inventory_cover_weeks / .forecast_bias_correction
+/ .min_run_hours with levers.resolve(field, sku_abc_class), where
+sku_abc_class comes from self.sku_master.loc[s, "abc_class"] — already
+available, no new lookup machinery needed.
+
+z (the service-target quantile) and cover_months, currently computed ONCE
+outside the per-SKU loop from a single scalar, MUST move inside the loop and
+be recomputed per SKU from its own resolved service_target / cover. This is
+the actual mechanical change; everything else in simulate() — production,
+shipment, ageing, write-off, excess — is already per-SKU and untouched.
+
+min_run_hours resolution feeds the SAME batch-floor calculation that already
+exists (max(moq_units, min_run_hours * units_per_hour)), just with a
+per-class value instead of a line-wide scalar.
+
+forecast_bias_correction resolution feeds project_plan() the same way —
+per-SKU lookup by class, D-035's flagged-SKU override (zero correction
+regardless of lever value) still applies on top, unchanged.
+
+CAPACITY remains checked exactly once per month, in aggregate, across ALL
+SKUs' resulting batches — this logic is UNCHANGED. The fix is that the
+batches now reflect each SKU's own class's policy, so the aggregate check is
+for the first time checking something that could actually be run.
+
+
+TESTS — extend tests/test_engine.py
+-------------------------------------
+  test_per_class_levers_resolve_correctly
+      three SKUs of different classes on the same line get demonstrably
+      different target_stock_units under a per-class LeverSettings — proves
+      resolve() is actually wired into simulate(), not just accepted and
+      ignored.
+  test_scalar_levers_still_work_unchanged
+      run_scenario with a plain scalar LeverSettings (old style) on the Step 6
+      gate scenario reproduces D-060's figures exactly — backward
+      compatibility is not aspirational, it is tested against the actual
+      passed-gate numbers.
+  test_per_class_out_of_range_raises
+      one class's value outside assumptions.levers.*.range raises, even if
+      the other two classes are valid.
+  test_missing_class_in_dict_raises
+      a dict missing e.g. "C" raises EngineViolation, not a KeyError leaking
+      out of resolve().
+  test_capacity_is_checked_once_on_the_real_combined_schedule
+      construct a per-class LeverSettings where class A's policy alone would
+      fit easily but class A + B + C's COMBINED batches breach capacity;
+      assert the shortfall/backlog mechanism fires — proves the aggregate
+      check sees the true joint schedule, not an approval granted class by
+      class.
+  test_defaults_per_class_matches_existing_scalar_defaults_per_class
+      for a single-class-only comparison (e.g. all SKUs treated as class A),
+      defaults_per_class() and the existing defaults() must produce numerically
+      identical resolved values — proves the new method is a strict
+      generalisation, not a divergent parallel implementation.
+  test_min_run_hours_per_class_moves_batch_floor_per_class
+      two SKUs of different classes, same demand shape, produce different
+      production_units under different class min-run values — direct evidence
+      the batch floor is genuinely class-aware now.
+
+Every existing Step 6/7/8 test must still pass unmodified — this is the
+backward-compatibility bar, not a suite to be edited to fit the change.
+
+
+-------------------------------------------------------------------------------
+K — KEY DATA STRUCTURE
+-------------------------------------------------------------------------------
+
+LeverSettings, per-class form:
+
+  LeverSettings(
+      service_target={"A": 0.995, "B": 0.95, "C": 0.88},
+      inventory_cover_weeks={"A": 3.5, "B": 2.5, "C": 1.5},
+      forecast_bias_correction={"A": 0.0, "B": 0.15, "C": 0.3},
+      min_run_hours={"A": 8.0, "B": 5.0, "C": 2.0},
+  )
+
+Scalar form (unchanged, still valid, still what Step 8's sweep uses):
+
+  LeverSettings(
+      service_target=0.985, inventory_cover_weeks=4.0,
+      forecast_bias_correction=0.0, min_run_hours=7.0,
+  )
+
+sku_month gains no new columns — target_stock_units, safety_stock_units,
+production_units etc. are the same fields, now correctly varying per SKU by
+class where they didn't fully before.
+
+
+-------------------------------------------------------------------------------
+E — EXTRA DETAILS
+-------------------------------------------------------------------------------
+
+- No hard-coded class names beyond "A"/"B"/"C" already used throughout
+  assumptions.abc — do not invent a different class scheme.
+- defaults() (scalar, single-class) stays; defaults_per_class() is new and
+  additive. Neither replaces the other.
+- Nothing in this prompt touches Step 7, 8, 9, 10, or 11. Those are separate,
+  sequenced prompts that consume this engine once it passes its own tests.
+- This is built and tested on branch engine-per-class-levers, pushed
+  incrementally as it passes tests — not held until "done" to push once.
+- Nothing is final until it has run in Colab and been confirmed by the
+  reviewer's own run (D-037). Sandbox agreement is not evidence.

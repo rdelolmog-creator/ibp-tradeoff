@@ -393,6 +393,272 @@ def optimise_all_lines(
 
 
 # ---------------------------------------------------------------------------
+# PART 1b — D-071. Joint per-class search, superseding optimise_all_lines()
+#
+# The functions above search UNIFORM line-wide (cover, service) points and
+# then, for each SKU, cherry-pick whichever uniform run happened to be
+# cheapest for it. That combination — "SKU A at its own optimum, SKU B at a
+# DIFFERENT optimum, simultaneously" — was never actually simulated, and
+# capacity was verified only for each individual uniform run, never for the
+# real combined policy. D-071 retracts that result.
+#
+# This section fixes it: cover and service are searched PER CLASS, and every
+# candidate combination is ONE REAL run_scenario() call with a full per-class
+# LeverSettings. Whatever is returned as "optimal" is a plan that was
+# actually, jointly simulated — capacity infeasible candidates are excluded
+# before cost is even compared, not discovered after the fact.
+#
+# Scope decision (stated, not hidden): forecast_bias_correction and
+# min_run_hours are held at fixed scalars DURING THIS SEARCH. Not an engine
+# limitation — D-071 made both per-class-capable — but a full 3-class x
+# 4-lever grid is 3^12 combinations, computationally infeasible in the
+# available time. Cover is what drives batch size and therefore aggregate
+# workload, which is where the capacity-feasibility defect actually lived;
+# widening the search to all four levers per class is a legitimate future
+# extension, not attempted here.
+# ---------------------------------------------------------------------------
+
+ABC_CLASSES = ("A", "B", "C")
+
+
+def joint_policy_grid(
+    assumptions: Dict[str, Any], n: int = 3
+) -> Tuple[List[float], List[float]]:
+    """n values per lever from assumptions.levers.*.range — same principle as
+    every prior grid, no literals."""
+    lev = assumptions["levers"]
+    c_lo, c_hi = (float(v) for v in lev["inventory_cover_weeks"]["range"])
+    s_lo, s_hi = (float(v) for v in lev["service_target_by_abc"]["range"])
+    cover = [round(v, 4) for v in np.linspace(c_lo, c_hi, n)]
+    service = [round(v, 4) for v in np.linspace(s_lo, s_hi, n)]
+    return cover, service
+
+
+def search_joint_policy(
+    engine: TradeOffEngine,
+    line_id: str,
+    cover_values: Sequence[float],
+    service_values: Sequence[float],
+    bias_correction: float = 0.0,
+    min_run_hours: Optional[float] = None,
+    extra_combos: Optional[Sequence[Tuple[float, float, float, float, float, float]]] = None,
+) -> pd.DataFrame:
+    """Full factorial over (cover_A, cover_B, cover_C, service_A, service_B,
+    service_C) — every combination is ONE REAL joint simulation.
+
+    This is the entire fix: each row's capacity_shortfall_total is the TRUE
+    aggregate answer for that exact combination, because that exact
+    combination is what was simulated — not an inference stitched from
+    separate single-class runs.
+
+    `extra_combos` guarantees specific points (typically each class's actual
+    default policy) are evaluated even if the grid is too coarse to land on
+    them exactly. Without this, D-067's failure mode recurs one level up: a
+    coarse grid can score worse everywhere it samples than an untested
+    default point, making "optimal" appear worse than "default" — which is
+    structurally impossible when default is itself an admissible candidate.
+    """
+    if min_run_hours is None:
+        skus = engine.line_skus(line_id)
+        if not skus:
+            raise PolicyModelViolation(f"no SKUs allocated to line {line_id!r}")
+        category = str(engine.sku_master.loc[skus[0], "category"])
+        min_run_hours = float(
+            engine.assumptions["categories"][category]["min_run_hours"]
+        )
+
+    rows: List[Dict[str, Any]] = []
+    combos = set(
+        itertools.product(cover_values, cover_values, cover_values,
+                           service_values, service_values, service_values)
+    )
+    for extra in extra_combos or []:
+        combos.add(tuple(round(float(v), 6) for v in extra))
+
+    for cov_a, cov_b, cov_c, svc_a, svc_b, svc_c in combos:
+        levers = LeverSettings(
+            service_target={"A": svc_a, "B": svc_b, "C": svc_c},
+            inventory_cover_weeks={"A": cov_a, "B": cov_b, "C": cov_c},
+            forecast_bias_correction=float(bias_correction),
+            min_run_hours=float(min_run_hours),
+        ).validate(engine.assumptions)
+        res = engine.run_scenario(line_id, levers)
+        rows.append(
+            {
+                "line_id": line_id,
+                "cover_A": cov_a, "cover_B": cov_b, "cover_C": cov_c,
+                "service_A": svc_a, "service_B": svc_b, "service_C": svc_c,
+                "bias_correction": float(bias_correction),
+                "min_run_hours": float(min_run_hours),
+                **res.totals,
+                "capacity_shortfall_total": float(
+                    res.line_month["capacity_shortfall_units"].sum()
+                ),
+                "utilisation_max": float(res.line_month["utilisation"].max()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def best_feasible_policy(search_result: pd.DataFrame) -> pd.Series:
+    """Filter to FEASIBLE candidates first, then pick the cheapest.
+
+    This ordering is the whole point: an infeasible-but-cheap combination is
+    never eligible, so whatever this returns is a plan that could actually
+    run. Raises if nothing in the grid is feasible — that is itself a finding
+    (the grid's range cannot satisfy capacity anywhere) and must not be
+    silently papered over by returning the least-bad infeasible point.
+    """
+    feasible = search_result[search_result["capacity_shortfall_total"] <= 1e-6]
+    if feasible.empty:
+        raise PolicyModelViolation(
+            "no combination in the search grid is capacity-feasible — every "
+            "candidate breached capacity. Widen the grid or lower demand "
+            "before trusting any 'optimal' figure from this search."
+        )
+    return feasible.loc[feasible["total_economic_cost_eur"].idxmin()]
+
+
+def search_all_lines(
+    engine: TradeOffEngine, n: int = 3, bias_correction: float = 0.0
+) -> pd.DataFrame:
+    """The feasible optimum for every line: one row each.
+
+    default_total_cost_eur is each line's TRUE per-class default policy —
+    each class at ITS OWN class's default cover/service (LeverSettings.
+    defaults_per_class()), the same "Base" concept the dashboard mockup
+    uses — not the old convention of applying class A's policy to every SKU
+    on the line. That default combination is guaranteed to be an evaluated
+    candidate (extra_combos), so the optimum can never come out worse than
+    the baseline it is measured against — the exact D-067 failure mode,
+    recurring one level up if left unguarded.
+    """
+    cover_values, service_values = joint_policy_grid(engine.assumptions, n=n)
+    rows: List[Dict[str, Any]] = []
+
+    for line_id in engine.line_master["line_id"]:
+        skus = engine.line_skus(line_id)
+        if not skus:
+            continue
+        category = str(engine.sku_master.loc[skus[0], "category"])
+        default_levers = LeverSettings.defaults_per_class(
+            engine.assumptions, category
+        )
+        default_combo = (
+            default_levers.inventory_cover_weeks["A"],
+            default_levers.inventory_cover_weeks["B"],
+            default_levers.inventory_cover_weeks["C"],
+            default_levers.service_target["A"],
+            default_levers.service_target["B"],
+            default_levers.service_target["C"],
+        )
+
+        search = search_joint_policy(
+            engine, line_id, cover_values, service_values,
+            bias_correction=bias_correction,
+            extra_combos=[default_combo],
+        )
+        best = best_feasible_policy(search)
+
+        default_res = engine.run_scenario(line_id, default_levers)
+        default_total = default_res.totals["total_economic_cost_eur"]
+
+        row = best.to_dict()
+        row["default_total_cost_eur"] = default_total
+        row["saving_eur"] = default_total - best["total_economic_cost_eur"]
+        row["assumption_fingerprint"] = engine.assumption_fingerprint
+        rows.append(row)
+
+    if not rows:
+        raise PolicyModelViolation("no line produced a feasible policy")
+    return pd.DataFrame(rows)
+
+
+def expand_to_sku_level(
+    line_results: pd.DataFrame, engine: TradeOffEngine
+) -> pd.DataFrame:
+    """One row per SKU, inheriting its own class's chosen policy from its
+    line's winning combination.
+
+    Re-reads the ALREADY-COMPUTED winning scenario's sku_month rather than
+    re-simulating — the per-SKU lost_sales_eur / excess_obsolescence_eur /
+    working_capital_cost_eur come directly from the one joint simulation that
+    produced the winning row. Conversion cost is NOT split per SKU: it stays
+    a line total, repeated and explicitly labelled as such (D-066's finding
+    that it isn't separable per SKU still holds — the difference from the
+    retracted version is this file no longer pretends a per-SKU split is a
+    policy result).
+    """
+    rows: List[Dict[str, Any]] = []
+    for _, line_row in line_results.iterrows():
+        line_id = line_row["line_id"]
+        levers = LeverSettings(
+            service_target={
+                c: float(line_row[f"service_{c}"]) for c in ABC_CLASSES
+            },
+            inventory_cover_weeks={
+                c: float(line_row[f"cover_{c}"]) for c in ABC_CLASSES
+            },
+            forecast_bias_correction=float(line_row["bias_correction"]),
+            min_run_hours=float(line_row["min_run_hours"]),
+        ).validate(engine.assumptions)
+        res = engine.run_scenario(line_id, levers)
+        s = res.sku_month
+        line_conv = float(line_row["conversion_cost_eur"])
+
+        skus = engine.line_skus(line_id)
+        for sku_id in skus:
+            abc_class = str(engine.sku_master.loc[sku_id, "abc_class"])
+            sku_rows = s[s["sku_id"] == sku_id]
+            rows.append(
+                {
+                    "sku_id": sku_id,
+                    "line_id": line_id,
+                    "abc_class": abc_class,
+                    "cover_weeks": float(line_row[f"cover_{abc_class}"]),
+                    "service_target": float(line_row[f"service_{abc_class}"]),
+                    "lost_sales_eur": float(sku_rows["lost_sales_eur"].sum()),
+                    "excess_obsolescence_eur": float(
+                        sku_rows["excess_obsolescence_eur"].sum()
+                    ),
+                    "working_capital_cost_eur": float(
+                        sku_rows["working_capital_cost_eur"].sum()
+                    ),
+                    "line_conversion_cost_eur": line_conv,
+                    "assumption_fingerprint": res.assumption_fingerprint,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def sku_level_for_policy_model(sku_level: pd.DataFrame) -> pd.DataFrame:
+    """Reshapes expand_to_sku_level()'s output into what PolicyModel expects.
+
+    PolicyModel (Part 2, below) was built against the RETIRED per-SKU search
+    and still reads column names optimal_cover_weeks / optimal_service_target
+    — kept as-is rather than renamed throughout, since PolicyModel's own
+    logic (feature assembly, LOO evaluation, SHAP) is unaffected by D-071 and
+    does not need to change, only the column names feeding it do.
+
+    edge_optimum_flag is set False for every row: the OLD flag existed
+    because the retired per-SKU search commonly landed on grid boundaries as
+    an ARTEFACT of attributing a uniform-line run to one SKU. These rows are
+    genuinely joint-optimal, feasibility-filtered points — a class value
+    sitting at the edge of the tested range here means the constraint
+    binds, not that the search failed, so there is no reason to exclude
+    these rows from training the way the old flag was designed to.
+    """
+    out = sku_level.rename(
+        columns={
+            "cover_weeks": "optimal_cover_weeks",
+            "service_target": "optimal_service_target",
+        }
+    ).copy()
+    out["edge_optimum_flag"] = False
+    return out
+
+
+# ---------------------------------------------------------------------------
 # PART 2 — the policy model
 # ---------------------------------------------------------------------------
 

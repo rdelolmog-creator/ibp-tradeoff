@@ -29,7 +29,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -52,12 +52,19 @@ class LeverSettings:
 
     Scope is frozen at four (architecture §5). A fifth lever does not belong
     here; it belongs in a conversation about what comes out.
+
+    Each field is EITHER a single float (one value for the whole line — the
+    original design, still valid, still what Step 8's uniform-line sweep
+    uses) OR a dict {"A": x, "B": y, "C": z} giving each ABC class its own
+    value (D-071). Capacity is checked once, in aggregate, on whatever real
+    combined batch schedule results — the per-class form does not weaken that
+    check, it makes it check something that could actually be run.
     """
 
-    service_target: float
-    inventory_cover_weeks: float
-    forecast_bias_correction: float
-    min_run_hours: float
+    service_target: Union[float, Dict[str, float]]
+    inventory_cover_weeks: Union[float, Dict[str, float]]
+    forecast_bias_correction: Union[float, Dict[str, float]]
+    min_run_hours: Union[float, Dict[str, float]]
 
     _RANGE_KEYS = {
         "service_target": "service_target_by_abc",
@@ -66,23 +73,45 @@ class LeverSettings:
         "min_run_hours": "min_run_hours",
     }
 
+    def resolve(self, field: str, abc_class: str) -> float:
+        """The value that field takes for a given SKU's ABC class.
+
+        A scalar field resolves to itself regardless of class — the original,
+        still-supported behaviour. A dict field must contain the class; a
+        missing class raises rather than silently falling back to a default,
+        because a silently-guessed lever value is worse than a loud failure.
+        """
+        value = getattr(self, field)
+        if isinstance(value, dict):
+            if abc_class not in value:
+                raise EngineViolation(
+                    f"{field} is a per-class dict but has no entry for "
+                    f"abc_class={abc_class!r}: {sorted(value.keys())}"
+                )
+            return float(value[abc_class])
+        return float(value)
+
     def validate(self, assumptions: Dict[str, Any]) -> "LeverSettings":
         levers = assumptions["levers"]
         for field_name, key in self._RANGE_KEYS.items():
             lo, hi = (float(v) for v in levers[key]["range"])
-            value = float(getattr(self, field_name))
-            if not (lo - 1e-12 <= value <= hi + 1e-12):
-                raise EngineViolation(
-                    f"{field_name}={value} is outside assumptions.levers."
-                    f"{key}.range = [{lo}, {hi}]"
-                )
+            raw = getattr(self, field_name)
+            values = raw.values() if isinstance(raw, dict) else [raw]
+            for value in values:
+                value = float(value)
+                if not (lo - 1e-12 <= value <= hi + 1e-12):
+                    raise EngineViolation(
+                        f"{field_name}={value} is outside assumptions.levers."
+                        f"{key}.range = [{lo}, {hi}]"
+                    )
         return self
 
     @classmethod
     def defaults(
         cls, assumptions: Dict[str, Any], category: str, abc_class: str = "A"
     ) -> "LeverSettings":
-        """Slider defaults, read from config — never literals in code."""
+        """Scalar defaults for a single class. Original method, UNCHANGED —
+        Step 8's uniform-line sweep depends on this exact behaviour."""
         abc = assumptions["abc"][abc_class]
         return cls(
             service_target=float(abc["service_floor"]),
@@ -91,7 +120,34 @@ class LeverSettings:
             min_run_hours=float(assumptions["categories"][category]["min_run_hours"]),
         ).validate(assumptions)
 
-    def replace(self, **kwargs: float) -> "LeverSettings":
+    @classmethod
+    def defaults_per_class(
+        cls, assumptions: Dict[str, Any], category: str
+    ) -> "LeverSettings":
+        """Per-class defaults for all three ABC classes at once (D-071).
+
+        min_run_hours defaults to the SAME category value for every class,
+        because assumptions.yaml declares no per-class min-run default — this
+        is not inventing a per-class default that doesn't exist in config,
+        it is applying the one category-level default uniformly until a
+        planner actually differentiates it via the lever.
+        """
+        abc_classes = assumptions["abc"]
+        min_run = float(assumptions["categories"][category]["min_run_hours"])
+        return cls(
+            service_target={
+                c: float(cfg["service_floor"]) for c, cfg in abc_classes.items()
+            },
+            inventory_cover_weeks={
+                c: float(cfg["target_cover_weeks"]) for c, cfg in abc_classes.items()
+            },
+            forecast_bias_correction={c: 0.0 for c in abc_classes},
+            min_run_hours={c: min_run for c in abc_classes},
+        ).validate(assumptions)
+
+    def replace(
+        self, **kwargs: Union[float, Dict[str, float]]
+    ) -> "LeverSettings":
         data = {
             "service_target": self.service_target,
             "inventory_cover_weeks": self.inventory_cover_weeks,
@@ -101,7 +157,7 @@ class LeverSettings:
         data.update(kwargs)
         return LeverSettings(**data)
 
-    def as_dict(self) -> Dict[str, float]:
+    def as_dict(self) -> Dict[str, Union[float, Dict[str, float]]]:
         return {
             "service_target": self.service_target,
             "inventory_cover_weeks": self.inventory_cover_weeks,
@@ -364,9 +420,16 @@ class TradeOffEngine:
         converted with expm1 before use. `chronic_bias_pct_l1` is NOT read: it
         lives in the diagnostics file, outside Step 5a's fixed nine-column
         contract.
+
+        D-071: forecast_bias_correction is resolved PER SKU by its own
+        abc_class, exactly like the other three levers — no structural reason
+        survived scrutiny for forcing it uniform across a line.
         """
-        c = float(levers.forecast_bias_correction)
         out = demand.copy()
+        abc_by_sku = self.sku_master.loc[out["sku_id"], "abc_class"].astype(str)
+        c = abc_by_sku.map(
+            lambda cls: levers.resolve("forecast_bias_correction", cls)
+        ).to_numpy(dtype=float)
         bias_log = self.demand_characteristics["chronic_bias_l1"].reindex(
             out["sku_id"]
         ).to_numpy(dtype=float)
@@ -404,9 +467,14 @@ class TradeOffEngine:
         plan = self.project_plan(demand, levers)
 
         skus = self.line_skus(line_id)
-        z = _service_z(levers.service_target)
-        cover_months = float(levers.inventory_cover_weeks) / WEEKS_PER_MONTH
-        min_run_units = float(levers.min_run_hours) * units_per_hour
+        # D-071. z, cover_months and min_run_units used to be computed ONCE
+        # here from a single scalar LeverSettings and applied uniformly to
+        # every SKU. They are now resolved PER SKU, inside the loop, from
+        # that SKU's own abc_class — levers.resolve() returns the scalar
+        # unchanged if the field is still a plain float (old behaviour,
+        # Step 8's uniform-line sweep depends on this staying identical), or
+        # that class's own value if the field is a per-class dict.
+        abc_by_sku = self.sku_master.loc[skus, "abc_class"].astype(str).to_dict()
 
         cv = self.demand_characteristics["irreducible_volatility_cv"].reindex(skus)
         cv = cv.fillna(cv.median()).to_dict()
@@ -450,6 +518,16 @@ class TradeOffEngine:
                 plan_units = float(row["plan_units"])
                 demand_units = float(row["demand_units"])
                 stock_open = sum(l[1] for l in layers[s])
+
+                abc_class = abc_by_sku[s]
+                z = _service_z(levers.resolve("service_target", abc_class))
+                cover_months = (
+                    levers.resolve("inventory_cover_weeks", abc_class)
+                    / WEEKS_PER_MONTH
+                )
+                min_run_units = (
+                    levers.resolve("min_run_hours", abc_class) * units_per_hour
+                )
 
                 # Order-up-to level: cycle stock from the cover lever plus
                 # safety stock from the service lever. Deliberately NOT

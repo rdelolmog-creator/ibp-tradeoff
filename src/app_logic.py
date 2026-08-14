@@ -1,14 +1,15 @@
 """Step 10 — app logic, kept entirely separate from Streamlit.
 
 Contains NO `import streamlit` anywhere in this file — that is what keeps it
-testable with plain pytest exactly like every other src/ module, and it is
-asserted by test_no_streamlit_import_in_app_logic.
+testable with plain pytest exactly like every other src/ module (asserted by
+test_no_streamlit_import_in_app_logic).
 
-Every function here either (a) regenerates a cheap, deterministic artefact
-the same way Steps 4/6/7/8 already do, or (b) forwards to
-src.engine / src.reporter and adds nothing. No new economic logic. If a
-function in this file computes a cost rather than calling something that
-already computes it, that is a scope violation (D-072's own discipline).
+Rewritten for D-071/D-072: the app now drives PER-CLASS levers directly
+(matching the engine's real capability and the dashboard mockup agreed with
+the user), and capacity warnings are computed LIVE from the actual scenario
+being viewed — not looked up in a static Step 8 table. Every number traces to
+engine.run_scenario() or a Step 9 reporter function; this file adds no
+economic logic of its own.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import yaml
@@ -28,16 +29,19 @@ from src.portfolio_impact import get_flagged_skus
 from src.reporter import (
     ReporterViolation,
     avoidable_cost_view,
-    capacity_warning,
+    class_breakdown_view,
+    line_policy_brief,
     owner_view,
-    policy_brief,
     require_artefact,
 )
+
+ABC_CLASSES = ("A", "B", "C")
 
 APP_DATA_FILES = {
     "demand_characteristics": "app_data/demand_characteristics.csv",
     "censoring_diagnostics": "app_data/censoring_diagnostics.csv",
-    "optimal_policy": "app_data/optimal_policy.csv",
+    "line_results": "app_data/line_results.csv",
+    "sku_level": "app_data/sku_level.csv",
     "portfolio_summary": "app_data/step08_portfolio_summary.csv",
     "lever_consistency": "app_data/step08_lever_consistency.csv",
 }
@@ -63,7 +67,7 @@ def load_config(repo_root: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Regenerated data (D-072: cheap enough to derive on demand)
+# Regenerated data
 # ---------------------------------------------------------------------------
 
 
@@ -71,22 +75,13 @@ def build_clean_data(
     repo_root: str, data_root: Optional[str] = None
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Regenerate clean_master and sku_master via the SAME
-    DataIngestor/DataCleaner path Steps 4/6/7/8 use. No duplicated cleaning
-    logic. Deterministic (seeded), safe to do at every cold start.
+    DataIngestor/DataCleaner path every notebook uses.
 
-    Streamlit Cloud mounts the repo READ-ONLY (the deploy path is typically
-    something like /mount/src/<repo>). generate_data.py defaults to writing
-    inside repo_root, which fails there — and the original implementation ran
-    it via `subprocess.run(..., check=True)`, whose CalledProcessError does
-    not surface the underlying Python traceback, so the real cause (a
-    permission error) was invisible in the deploy log.
-
-    Fixed two ways: (1) the generator is imported and run IN-PROCESS rather
-    than via subprocess, so any failure raises the real exception with a full
-    traceback; (2) generated data is written to a WRITABLE location — the
-    system temp directory by default — never into repo_root itself. repo_root
-    is still used, read-only, to locate config/schema.yaml and
-    config/assumptions.yaml.
+    Streamlit Cloud mounts the repo READ-ONLY. generate_data.py is imported
+    and run IN-PROCESS (not via subprocess, whose CalledProcessError hides
+    the real traceback) and writes to a WRITABLE temp directory, never into
+    repo_root — the fix for the deploy failure this project hit the first
+    time this ran on Streamlit Cloud.
     """
     if data_root is None:
         data_root = os.path.join(tempfile.gettempdir(), "ibp-tradeoff-data")
@@ -95,9 +90,8 @@ def build_clean_data(
     if not os.path.isdir(raw_dir):
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
-        from generate_data import SyntheticDataGenerator  # local import: keeps
+        from generate_data import SyntheticDataGenerator
 
-        # this dependency confined to the one function that needs it
         SyntheticDataGenerator(
             repo_root=data_root,
             schema_path=os.path.join(repo_root, "config", "schema.yaml"),
@@ -114,17 +108,13 @@ def build_clean_data(
 
 
 # ---------------------------------------------------------------------------
-# Committed app data (D-072: Step 5a/7/8 outputs, not regenerated)
+# Committed app data
 # ---------------------------------------------------------------------------
 
 
 def load_app_data(repo_root: str) -> Dict[str, pd.DataFrame]:
-    """Load the five committed app_data/ files.
-
-    Raises with a clear message naming the missing file if any is absent —
-    reuses src.reporter.require_artefact's contract rather than reimplementing
-    it, so the failure message style is consistent across every step.
-    """
+    """Load the six committed app_data/ files, naming the missing one if any
+    is absent — reuses src.reporter.require_artefact's contract."""
     out: Dict[str, pd.DataFrame] = {}
     for key, rel_path in APP_DATA_FILES.items():
         path = require_artefact(os.path.join(repo_root, rel_path))
@@ -144,11 +134,6 @@ def build_engine(
     sku_master: pd.DataFrame,
     app_data: Dict[str, pd.DataFrame],
 ) -> TradeOffEngine:
-    """Construct TradeOffEngine from committed + regenerated inputs.
-
-    Flagged SKUs come from get_flagged_skus — the same function every
-    notebook uses, not a reimplementation.
-    """
     demand_characteristics = app_data["demand_characteristics"].set_index("sku_id")
     censoring_diagnostics = app_data["censoring_diagnostics"]
     flagged = get_flagged_skus(censoring_diagnostics)
@@ -160,15 +145,11 @@ def build_engine(
 def fingerprint_status(
     engine: TradeOffEngine, app_data: Dict[str, pd.DataFrame]
 ) -> Dict[str, Any]:
-    """Compare the live engine's assumption fingerprint against the one
-    recorded in the committed Step 7 output.
-
-    The app WARNS on mismatch, never blocks (D-072) — a stale reference table
-    is still better than no table, but the person using it must see the
-    mismatch rather than trust it silently.
-    """
+    """Compare the live engine's fingerprint against the committed Step 7
+    output's. WARNS on mismatch, never blocks — a stale reference table is
+    still better than no table, but the mismatch must be visible."""
     live = engine.assumption_fingerprint
-    static_series = app_data["optimal_policy"].get("assumption_fingerprint")
+    static_series = app_data["line_results"].get("assumption_fingerprint")
     static = (
         str(static_series.iloc[0])
         if static_series is not None and len(static_series)
@@ -178,54 +159,173 @@ def fingerprint_status(
 
 
 # ---------------------------------------------------------------------------
-# Scenario view — thin forward to engine + reporter
+# Lever presets
 # ---------------------------------------------------------------------------
 
 
-def scenario_view(
+def base_levers_for_line(
+    engine: TradeOffEngine, assumptions: Dict[str, Any], line_id: str
+) -> LeverSettings:
+    """The true per-class default (D-071/D-072's 'Base') — each class at its
+    OWN class's default cover/service, not class A applied to everyone."""
+    skus = engine.line_skus(line_id)
+    category = str(engine.sku_master.loc[skus[0], "category"])
+    return LeverSettings.defaults_per_class(assumptions, category)
+
+
+def optimal_levers_for_line(
+    line_results: pd.DataFrame, line_id: str
+) -> LeverSettings:
+    """The jointly-feasible optimum for one line, from Step 7's committed
+    search_all_lines() output. Only meaningful for a SINGLE line: different
+    lines have independently-found optima, so 'jump to optimal' does not
+    generalise cleanly to a multi-line selection — the app restricts the
+    jump action to a single selected line."""
+    row = line_results[line_results["line_id"] == line_id]
+    if row.empty:
+        raise AppLogicViolation(
+            f"no committed optimal policy for line {line_id!r} — "
+            f"app_data/line_results.csv may be stale or incomplete"
+        )
+    r = row.iloc[0]
+    return LeverSettings(
+        service_target={c: float(r[f"service_{c}"]) for c in ABC_CLASSES},
+        inventory_cover_weeks={c: float(r[f"cover_{c}"]) for c in ABC_CLASSES},
+        forecast_bias_correction=float(r["bias_correction"]),
+        min_run_hours=float(r["min_run_hours"]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Live multi-line scenario — the core of the app
+# ---------------------------------------------------------------------------
+
+
+def run_scenario_for_lines(
     engine: TradeOffEngine,
-    line_id: str,
+    line_ids: List[str],
     levers: LeverSettings,
     assumptions: Dict[str, Any],
     schema: Dict[str, Any],
-) -> Dict[str, float]:
-    """Run one scenario and format it. Calls engine.run_scenario then
-    src.reporter.avoidable_cost_view — does NOT recompute anything either of
-    those already do. This function only assembles inputs and forwards.
+) -> Dict[str, Any]:
+    """Run ONE per-class LeverSettings across every selected line and
+    aggregate. This is genuinely live — every number here comes from a real
+    run_scenario() call made just now, not a cached or precomputed table.
+
+    Returns the combined avoidable-cost view (summed across lines), the
+    concatenated per-SKU sku_month for every selected line, and a per-line
+    capacity read (workload, shortfall) so the app can warn precisely.
     """
-    result = engine.run_scenario(line_id, levers)
-    return avoidable_cost_view(result, assumptions, schema)
+    if not line_ids:
+        raise AppLogicViolation("at least one line must be selected")
+
+    per_line_views: List[Dict[str, float]] = []
+    sku_frames: List[pd.DataFrame] = []
+    capacity_rows: List[Dict[str, Any]] = []
+
+    for line_id in line_ids:
+        result = engine.run_scenario(line_id, levers)
+        view = avoidable_cost_view(result, assumptions, schema)
+        per_line_views.append(view)
+
+        sku_month = result.sku_month.copy()
+        sku_month["line_id"] = line_id
+        sku_month["abc_class"] = sku_month["sku_id"].map(
+            engine.sku_master["abc_class"]
+        )
+        sku_frames.append(sku_month)
+
+        lm = result.line_month
+        capacity_rows.append(
+            {
+                "line_id": line_id,
+                "workload_hours_max": float(lm["workload_hours"].max()),
+                "hours_available": float(lm["hours_available"].iloc[0]),
+                "overtime_hours_total": float(lm["overtime_hours"].sum()),
+                "capacity_shortfall_total": float(
+                    lm["capacity_shortfall_units"].sum()
+                ),
+            }
+        )
+
+    combined: Dict[str, float] = {}
+    for key in per_line_views[0]:
+        if key in ("line_id", "assumption_fingerprint"):
+            continue
+        combined[key] = sum(v[key] for v in per_line_views)
+    combined["line_id"] = "+".join(line_ids) if len(line_ids) > 1 else line_ids[0]
+    combined["assumption_fingerprint"] = per_line_views[0]["assumption_fingerprint"]
+
+    return {
+        "avoidable_view": combined,
+        "sku_month": pd.concat(sku_frames, ignore_index=True),
+        "capacity": pd.DataFrame(capacity_rows),
+    }
 
 
-def capacity_check(
-    line_id: str, cover_weeks: float, portfolio_summary_df: pd.DataFrame
-) -> Optional[str]:
-    """Thin wrapper around src.reporter.capacity_warning."""
-    row = portfolio_summary_df.set_index("line_id").loc[line_id]
-    return capacity_warning(line_id, cover_weeks, row)
+def live_capacity_warnings(capacity_df: pd.DataFrame) -> List[str]:
+    """Warnings computed from the LIVE scenario just run — not a static
+    lookup. A line is flagged if this exact combination of levers produced
+    any unmet production requirement on it."""
+    warnings: List[str] = []
+    for _, row in capacity_df.iterrows():
+        if row["capacity_shortfall_total"] > 1e-6:
+            warnings.append(
+                f"{row['line_id']}: this combination breaches capacity — "
+                f"peak workload {row['workload_hours_max']:.0f}h against "
+                f"{row['hours_available']:.0f}h available "
+                f"(+{row['overtime_hours_total']:.0f}h overtime used), with "
+                f"{row['capacity_shortfall_total']:.0f} units short."
+            )
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# Reporter wrappers
+# ---------------------------------------------------------------------------
 
 
 def owner_table(
     avoidable_view: Dict[str, float], assumptions: Dict[str, Any]
 ) -> pd.DataFrame:
-    """Thin wrapper around src.reporter.owner_view."""
     return owner_view(avoidable_view, assumptions)
 
 
-def top_policy_moves(
-    optimal_policy_df: pd.DataFrame,
-    sku_master: pd.DataFrame,
-    assumptions: Dict[str, Any],
-    top_n: int = 10,
+def by_class_breakdown(
+    sku_month: pd.DataFrame, levers: LeverSettings
 ) -> pd.DataFrame:
-    """Thin wrapper around src.reporter.policy_brief, with the default-lever
-    lookup built from assumptions.abc — same construction Step 9's notebook
-    uses."""
-    default_levers_by_class = {
-        c: {
-            "inventory_cover_weeks": assumptions["abc"][c]["target_cover_weeks"],
-            "service_target": assumptions["abc"][c]["service_floor"],
-        }
-        for c in assumptions["abc"]
-    }
-    return policy_brief(optimal_policy_df, sku_master, default_levers_by_class, top_n)
+    """Real per-class economics for the CURRENT live scenario, in the shape
+    src.reporter.class_breakdown_view expects.
+
+    cover_weeks/service_target are derived here from the levers actually
+    used for this scenario — engine.sku_month does not carry them, since the
+    engine reasons in target_stock_units, not the lever value itself.
+    Conversion cost is not computed per SKU by the engine, so it is
+    intentionally absent here — shown once per line elsewhere in the app,
+    never split (D-066).
+
+    sku_month arrives as one row per SKU PER MONTH — it must be summed to one
+    row per SKU first, or class_breakdown_view's n_skus would count SKU-
+    months rather than SKUs.
+    """
+    per_sku = (
+        sku_month.groupby(["sku_id", "line_id", "abc_class"])
+        .agg(
+            lost_sales_eur=("lost_sales_eur", "sum"),
+            excess_obsolescence_eur=("excess_obsolescence_eur", "sum"),
+            working_capital_cost_eur=("working_capital_cost_eur", "sum"),
+        )
+        .reset_index()
+    )
+    per_sku["cover_weeks"] = per_sku["abc_class"].map(
+        lambda c: levers.resolve("inventory_cover_weeks", c)
+    )
+    per_sku["service_target"] = per_sku["abc_class"].map(
+        lambda c: levers.resolve("service_target", c)
+    )
+    per_sku["line_conversion_cost_eur"] = pd.NA
+    return class_breakdown_view(per_sku)
+
+
+def line_policy_table(line_results: pd.DataFrame) -> pd.DataFrame:
+    return line_policy_brief(line_results)

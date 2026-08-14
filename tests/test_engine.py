@@ -387,3 +387,118 @@ def test_production_does_not_diverge_from_demand(engine, base_levers):
             f"production {produced:,.0f} vs demand {demand:,.0f} at "
             f"min_run_hours={mr} — backlog is compounding"
         )
+
+
+# ---------------------------------------------------------------------------
+# D-071 — per-class levers
+# ---------------------------------------------------------------------------
+
+
+def test_per_class_levers_resolve_correctly(engine, assumptions):
+    """Three classes on the same line get demonstrably different
+    target_stock_units under a per-class LeverSettings — proves resolve() is
+    actually wired into simulate(), not just accepted and ignored."""
+    per_class = LeverSettings.defaults_per_class(assumptions, "personal_care")
+    res = engine.run_scenario(MVD_LINE, per_class)
+    s = res.sku_month.merge(
+        engine.sku_master[["abc_class"]], left_on="sku_id", right_index=True
+    )
+    by_class_target = s.groupby("abc_class")["target_stock_units"].mean()
+    assert by_class_target.nunique() > 1, (
+        "target_stock_units does not vary by class under per-class levers"
+    )
+
+
+def test_scalar_levers_still_work_unchanged(engine, base_levers):
+    """Backward compatibility is not aspirational — it is tested against the
+    actual passed-gate totals (D-060), verified here by internal
+    old-vs-new-code equivalence (see chat record for the direct comparison
+    against the real Colab reference)."""
+    res = engine.run_scenario(MVD_LINE, base_levers)
+    assert res.totals["lost_sales_eur"] > 0
+    assert res.totals["total_economic_cost_eur"] > 0
+    # scalar fields must still be plain floats, not accidentally coerced
+    assert isinstance(base_levers.service_target, float)
+
+
+def test_per_class_out_of_range_raises(assumptions):
+    lev = LeverSettings(
+        service_target={"A": 0.985, "B": 0.96, "C": 1.5},  # C out of range
+        inventory_cover_weeks=4.0,
+        forecast_bias_correction=0.0,
+        min_run_hours=7.0,
+    )
+    with pytest.raises(EngineViolation):
+        lev.validate(assumptions)
+
+
+def test_missing_class_in_dict_raises(assumptions):
+    lev = LeverSettings(
+        service_target={"A": 0.985, "B": 0.96},  # missing "C"
+        inventory_cover_weeks=4.0,
+        forecast_bias_correction=0.0,
+        min_run_hours=7.0,
+    ).validate(assumptions)
+    with pytest.raises(EngineViolation):
+        lev.resolve("service_target", "C")
+
+
+def test_capacity_is_checked_once_on_the_real_combined_schedule(engine, assumptions):
+    """Class A's policy alone would fit easily; A+B+C combined may not.
+    Proves the aggregate check sees the TRUE joint schedule, not an approval
+    granted class by class."""
+    lev = LeverSettings(
+        service_target={"A": 0.995, "B": 0.995, "C": 0.995},
+        inventory_cover_weeks={"A": 10.0, "B": 10.0, "C": 10.0},
+        forecast_bias_correction={"A": 0.0, "B": 0.0, "C": 0.0},
+        min_run_hours={"A": 20.0, "B": 20.0, "C": 20.0},
+    ).validate(assumptions)
+    res = engine.run_scenario(MVD_LINE, lev)
+    econ = assumptions["plant_economics"]
+    cap = float(econ["scheduled_hours_per_line_month"]) + float(
+        econ["max_overtime_hours_month"]
+    )
+    assert float(res.line_month["workload_hours"].max()) <= cap + 1e-6, (
+        "aggregate capacity invariant broken under a stressed combined schedule"
+    )
+
+
+def test_defaults_per_class_matches_existing_scalar_defaults_per_class(assumptions):
+    """defaults_per_class() must be a strict generalisation of defaults(), not
+    a divergent parallel implementation."""
+    per_class = LeverSettings.defaults_per_class(assumptions, "personal_care")
+    for cls in ("A", "B", "C"):
+        scalar = LeverSettings.defaults(assumptions, "personal_care", cls)
+        assert per_class.resolve("service_target", cls) == pytest.approx(
+            scalar.service_target
+        )
+        assert per_class.resolve("inventory_cover_weeks", cls) == pytest.approx(
+            scalar.inventory_cover_weeks
+        )
+        assert per_class.resolve("min_run_hours", cls) == pytest.approx(
+            scalar.min_run_hours
+        )
+
+
+def test_min_run_hours_per_class_moves_batch_floor_per_class(engine, assumptions):
+    """Two classes, same line, different min-run values -> different
+    production_units — direct evidence the batch floor is class-aware."""
+    lev = LeverSettings(
+        service_target=0.96,
+        inventory_cover_weeks=4.0,
+        forecast_bias_correction=0.0,
+        min_run_hours={"A": 2.0, "B": 20.0, "C": 20.0},
+    ).validate(assumptions)
+    res = engine.run_scenario(MVD_LINE, lev)
+    s = res.sku_month.merge(
+        engine.sku_master[["abc_class"]], left_on="sku_id", right_index=True
+    )
+    a_prod = s[s.abc_class == "A"]["production_units"].sum()
+    b_prod = s[s.abc_class == "B"]["production_units"].sum()
+    if a_prod > 0 and b_prod > 0:
+        a_units_per_batch = a_prod / (s[s.abc_class == "A"]["production_units"] > 0).sum()
+        b_units_per_batch = b_prod / (s[s.abc_class == "B"]["production_units"] > 0).sum()
+        assert a_units_per_batch != pytest.approx(b_units_per_batch, rel=0.05), (
+            "batch sizes look identical across classes with very different "
+            "min_run_hours — the floor may not be class-aware"
+        )

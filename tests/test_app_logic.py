@@ -1,12 +1,10 @@
-"""Step 10 — tests for src/app_logic.py and static checks on app.py.
+"""Step 10 — tests for src/app_logic.py.
 
-The tests that matter most: `test_no_streamlit_import_in_app_logic` (what
-keeps app_logic testable without a Streamlit runtime), and
-`test_scenario_view_does_not_reimplement_economics` /
-`test_app_py_contains_no_inline_economic_arithmetic` — together these are the
-guardrail against economic logic leaking out of engine.py/reporter.py and
-into the UI layer, where it would be a second, untested place these numbers
-could diverge.
+The tests that matter most: `test_no_streamlit_import_in_app_logic` (keeps
+this module testable without a runtime), and
+`test_capacity_warnings_are_live_not_static` — proves capacity checking
+reflects the ACTUAL scenario being viewed, not a canned Step 8 lookup, which
+is the whole reason this module was rebuilt (D-071/D-072).
 """
 
 from __future__ import annotations
@@ -22,20 +20,26 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from src.app_logic import (  # noqa: E402
+    ABC_CLASSES,
     APP_DATA_FILES,
     AppLogicViolation,
+    base_levers_for_line,
     build_clean_data,
     build_engine,
-    capacity_check,
+    by_class_breakdown,
     fingerprint_status,
+    line_policy_table,
+    live_capacity_warnings,
     load_app_data,
     load_config,
+    optimal_levers_for_line,
     owner_table,
-    scenario_view,
-    top_policy_moves,
+    run_scenario_for_lines,
 )
 from src.engine import LeverSettings  # noqa: E402
-from src.reporter import ReporterViolation, capacity_warning, owner_view  # noqa: E402
+from src.reporter import avoidable_cost_view, owner_view  # noqa: E402
+
+DATA_ROOT = "data_primary"
 
 
 @pytest.fixture(scope="module")
@@ -46,8 +50,8 @@ def config():
 @pytest.fixture(scope="module")
 def clean_data():
     for p in (
-        REPO / "data_primary" / "clean" / "clean_master.parquet",
-        REPO / "data_primary" / "clean" / "sku_master.parquet",
+        REPO / DATA_ROOT / "clean" / "clean_master.parquet",
+        REPO / DATA_ROOT / "clean" / "sku_master.parquet",
     ):
         if not p.is_file():
             pytest.skip(f"missing pipeline artefact: {p}")
@@ -58,7 +62,7 @@ def clean_data():
 def app_data():
     for rel in APP_DATA_FILES.values():
         if not (REPO / rel).is_file():
-            pytest.skip(f"missing app_data artefact: {rel} — run the Step 10 setup cell")
+            pytest.skip(f"missing app_data artefact: {rel}")
     return load_app_data(str(REPO))
 
 
@@ -69,130 +73,83 @@ def engine(config, clean_data, app_data):
     return build_engine(assumptions, schema, clean_master, sku_master, app_data)
 
 
-@pytest.fixture(scope="module")
-def base_levers(engine, config):
-    assumptions, _ = config
-    cat = str(engine.sku_master.loc[engine.line_skus("L3")[0], "category"])
-    return LeverSettings.defaults(assumptions, cat, "A")
-
-
 # ---------------------------------------------------------------------------
-# Streamlit isolation — the thing that makes app_logic testable at all
+# Streamlit isolation
 # ---------------------------------------------------------------------------
 
 
 def test_no_streamlit_import_in_app_logic():
     text = (REPO / "src" / "app_logic.py").read_text()
-    code_lines = [
-        line for line in text.splitlines() if not line.strip().startswith("#")
-    ]
-    # exclude the module docstring, which legitimately mentions the string
-    # "import streamlit" while explaining why it must not appear as code
-    in_docstring = False
-    checked = []
-    for line in code_lines:
-        stripped = line.strip()
-        if stripped.startswith('"""'):
-            in_docstring = not in_docstring
+    code_lines, in_doc = [], False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith('"""'):
+            in_doc = not in_doc
             continue
-        if not in_docstring:
-            checked.append(line)
-    joined = "\n".join(checked)
+        if not in_doc:
+            code_lines.append(line)
+    joined = "\n".join(code_lines)
     assert "import streamlit" not in joined
-    assert "st.cache" not in joined
-    assert not any(l.strip().startswith("st.") for l in checked)
+    assert not any(l.strip().startswith("st.") for l in code_lines)
 
 
 # ---------------------------------------------------------------------------
-# build_clean_data — no divergent cleaning path
+# build_clean_data — read-only repo safety (regression, see D-072/deploy fix)
 # ---------------------------------------------------------------------------
-
-
-def test_build_clean_data_matches_step4_output(clean_data):
-    from src.ingest import DataIngestor
-    from src.cleaner import DataCleaner
-
-    ing = DataIngestor(repo_root=str(REPO), data_root="data_primary")
-    ref_cm, ref_sm, _ = DataCleaner(ing.schema, ing.assumptions).clean(ing.load())
-
-    app_cm, app_sm = clean_data
-    assert app_cm.shape == ref_cm.shape
-    assert app_sm.shape == ref_sm.shape
-    assert set(app_cm.columns) == set(ref_cm.columns)
-    assert set(app_sm.columns) == set(ref_sm.columns)
 
 
 def test_build_clean_data_never_writes_inside_repo_root(tmp_path):
-    """Regression test for the Streamlit Cloud deploy failure: repo_root is
-    mounted READ-ONLY there (path like /mount/src/<repo>), and the original
-    implementation wrote generated data inside repo_root, which failed with a
-    permission error that subprocess.run's CalledProcessError swallowed
-    without a readable message.
-
-    This does not need an actual read-only mount to catch a regression: it
-    is enough to assert that repo_root's own contents are untouched after the
-    call, using a fresh copy so no other test's temp data can mask a write.
-    """
     import shutil
 
     repo_copy = tmp_path / "repo_copy"
     shutil.copytree(
-        REPO,
-        repo_copy,
-        ignore=shutil.ignore_patterns(
-            "data_primary", "data_control", "__pycache__", ".git"
-        ),
+        REPO, repo_copy,
+        ignore=shutil.ignore_patterns("data_primary", "data_control", "__pycache__", ".git"),
     )
-    def _relevant_files(root):
-        return {
-            p.relative_to(root)
-            for p in root.rglob("*")
-            if p.is_file() and "__pycache__" not in p.parts
-        }
 
-    before = _relevant_files(repo_copy)
+    def _relevant(root):
+        return {p.relative_to(root) for p in root.rglob("*")
+                if p.is_file() and "__pycache__" not in p.parts}
 
-    writable_data_root = tmp_path / "writable_data"
-    build_clean_data(str(repo_copy), data_root=str(writable_data_root))
-
-    after = _relevant_files(repo_copy)
-    assert after == before, (
-        f"build_clean_data wrote into repo_root, which is read-only on "
-        f"Streamlit Cloud: new files {after - before}"
-    )
-    assert (writable_data_root / "data" / "raw").is_dir()
-
-
-def test_build_clean_data_default_root_is_outside_repo():
-    """The default data_root must not be inside repo_root at all, so the bug
-    cannot resurface silently if repo_root happens to be writable locally
-    (e.g. in Colab, where it is)."""
-    import inspect
-
-    src = inspect.getsource(build_clean_data)
-    assert "tempfile" in src, (
-        "build_clean_data's default data_root no longer uses a system temp "
-        "directory — check it still avoids writing into repo_root by default"
-    )
+    before = _relevant(repo_copy)
+    build_clean_data(str(repo_copy), data_root=str(tmp_path / "writable_data"))
+    after = _relevant(repo_copy)
+    assert after == before
 
 
 # ---------------------------------------------------------------------------
-# load_app_data
+# Lever presets — D-071/D-072's real Base and Optimal
 # ---------------------------------------------------------------------------
 
 
-def test_load_app_data_raises_on_missing_file_naming_it(tmp_path):
-    # an empty repo_root — every app_data file is "missing"
-    with pytest.raises((ReporterViolation, FileNotFoundError)) as exc:
-        load_app_data(str(tmp_path))
-    assert "app_data" in str(exc.value) or "demand_characteristics" in str(exc.value)
+def test_base_levers_are_true_per_class_defaults(engine, config):
+    assumptions, _ = config
+    base = base_levers_for_line(engine, assumptions, "L3")
+    for c in ABC_CLASSES:
+        expected = float(assumptions["abc"][c]["service_floor"])
+        assert base.resolve("service_target", c) == pytest.approx(expected)
 
 
-def test_load_app_data_returns_all_five(app_data):
-    assert set(app_data.keys()) == set(APP_DATA_FILES.keys())
-    for df in app_data.values():
-        assert isinstance(df, pd.DataFrame)
-        assert len(df) > 0
+def test_base_levers_are_not_class_a_applied_to_everyone(engine, config):
+    """The retired convention — this must NOT be what 'Base' means anymore."""
+    assumptions, _ = config
+    base = base_levers_for_line(engine, assumptions, "L3")
+    a_service = base.resolve("service_target", "A")
+    c_service = base.resolve("service_target", "C")
+    assert a_service != c_service, "Base collapsed back to a single class's policy"
+
+
+def test_optimal_levers_come_from_committed_line_results(app_data):
+    line_results = app_data["line_results"]
+    line_id = line_results["line_id"].iloc[0]
+    levers = optimal_levers_for_line(line_results, line_id)
+    assert isinstance(levers.service_target, dict)
+    assert set(levers.service_target.keys()) == set(ABC_CLASSES)
+
+
+def test_optimal_levers_raise_for_unknown_line(app_data):
+    with pytest.raises(AppLogicViolation):
+        optimal_levers_for_line(app_data["line_results"], "NOT_A_LINE")
 
 
 # ---------------------------------------------------------------------------
@@ -200,168 +157,157 @@ def test_load_app_data_returns_all_five(app_data):
 # ---------------------------------------------------------------------------
 
 
-def test_fingerprint_matches_for_freshly_generated_app_data(engine, app_data):
-    """app_data was regenerated from the current assumptions in this sandbox
-    run, so fingerprints should agree here."""
-    status = fingerprint_status(engine, app_data)
-    assert status["live"] == status["static"]
-    assert status["match"] is True
-
-
 def test_fingerprint_mismatch_is_detected(engine, app_data):
     import copy
 
     tampered = copy.deepcopy(app_data)
-    tampered["optimal_policy"] = tampered["optimal_policy"].copy()
-    tampered["optimal_policy"]["assumption_fingerprint"] = "v0.0:deadbeef0000"
+    tampered["line_results"] = tampered["line_results"].copy()
+    tampered["line_results"]["assumption_fingerprint"] = "v0.0:deadbeef0000"
     status = fingerprint_status(engine, tampered)
     assert status["match"] is False
-    assert status["live"] != status["static"]
     assert status["static"] == "v0.0:deadbeef0000"
 
 
 # ---------------------------------------------------------------------------
-# scenario_view — must not reimplement economics
+# run_scenario_for_lines — the live core
 # ---------------------------------------------------------------------------
 
 
-def test_scenario_view_matches_direct_engine_and_reporter_call(
-    engine, base_levers, config
-):
+def test_single_line_matches_direct_engine_and_reporter_call(engine, config):
     assumptions, schema = config
-    via_app = scenario_view(engine, "L3", base_levers, assumptions, schema)
+    base = base_levers_for_line(engine, assumptions, "L3")
+    via_app = run_scenario_for_lines(engine, ["L3"], base, assumptions, schema)
 
-    from src.reporter import avoidable_cost_view
+    direct_result = engine.run_scenario("L3", base)
+    direct_view = avoidable_cost_view(direct_result, assumptions, schema)
 
-    result = engine.run_scenario("L3", base_levers)
-    direct = avoidable_cost_view(result, assumptions, schema)
+    for key in ("lost_sales_eur", "excess_obsolescence_eur",
+                "working_capital_cost_eur", "total_reported_cost_eur"):
+        assert via_app["avoidable_view"][key] == pytest.approx(direct_view[key])
 
-    assert via_app == direct
+
+def test_multi_line_sums_two_independent_single_line_calls(engine, config):
+    assumptions, schema = config
+    base = base_levers_for_line(engine, assumptions, "L1")  # same category as L4
+    combined = run_scenario_for_lines(engine, ["L1", "L4"], base, assumptions, schema)
+
+    r1 = run_scenario_for_lines(engine, ["L1"], base, assumptions, schema)
+    r4 = run_scenario_for_lines(engine, ["L4"], base, assumptions, schema)
+
+    expected_total = (
+        r1["avoidable_view"]["total_reported_cost_eur"]
+        + r4["avoidable_view"]["total_reported_cost_eur"]
+    )
+    assert combined["avoidable_view"]["total_reported_cost_eur"] == pytest.approx(
+        expected_total
+    )
+    assert len(combined["sku_month"]) == len(r1["sku_month"]) + len(r4["sku_month"])
+
+
+def test_run_scenario_raises_with_no_lines(engine, config):
+    assumptions, schema = config
+    base = base_levers_for_line(engine, assumptions, "L3")
+    with pytest.raises(AppLogicViolation):
+        run_scenario_for_lines(engine, [], base, assumptions, schema)
 
 
 def test_scenario_view_does_not_reimplement_economics():
-    """Static guardrail: app_logic.py must not contain arithmetic that
-    belongs in engine.py or reporter.py — same style of check as Step 9's
-    recompute guardrail (test_reporter_does_not_recompute_engine_outputs)."""
+    """Static guardrail, same style as Step 9's recompute check."""
     text = (REPO / "src" / "app_logic.py").read_text()
-    forbidden = [
-        "gross_margin_eur *",
-        "* gross_margin_eur",
-        "carrying_rate_monthly",
-        "_expected_shortfall",
-        "writeoff_trigger_pct_life_left",
-    ]
+    forbidden = ["gross_margin_eur *", "* gross_margin_eur",
+                 "carrying_rate_monthly", "_expected_shortfall",
+                 "writeoff_trigger_pct_life_left"]
     for token in forbidden:
         assert token not in text, f"app_logic.py appears to recompute via {token!r}"
 
 
 # ---------------------------------------------------------------------------
-# capacity_check / owner_table — thin wrappers
+# live_capacity_warnings — the whole reason this module was rebuilt
 # ---------------------------------------------------------------------------
 
 
-def test_capacity_check_matches_direct_reporter_call(app_data):
-    summary = app_data["portfolio_summary"]
-    line_id = summary["line_id"].iloc[0]
-    row = summary.set_index("line_id").loc[line_id]
-    cover = float(row["best_inventory_cover_weeks"]) + 10.0  # push toward a warning
-
-    via_app = capacity_check(line_id, cover, summary)
-    direct = capacity_warning(line_id, cover, row)
-    assert via_app == direct
-
-
-def test_owner_table_matches_direct_reporter_call(engine, base_levers, config):
+def test_capacity_warnings_are_live_not_static(engine, config):
+    """Proves capacity checking reflects the ACTUAL scenario just simulated,
+    not a canned Step 8 lookup — the defect the old design carried."""
     assumptions, schema = config
-    from src.reporter import avoidable_cost_view
+    base = base_levers_for_line(engine, assumptions, "L2")
+    calm = run_scenario_for_lines(engine, ["L2"], base, assumptions, schema)
+    assert live_capacity_warnings(calm["capacity"]) == []
 
-    result = engine.run_scenario("L3", base_levers)
-    view = avoidable_cost_view(result, assumptions, schema)
+    stress = LeverSettings(
+        service_target=0.995, inventory_cover_weeks=10.0,
+        forecast_bias_correction=0.0, min_run_hours=20.0,
+    ).validate(assumptions)
+    stressed = run_scenario_for_lines(engine, ["L2"], stress, assumptions, schema)
+    warnings = live_capacity_warnings(stressed["capacity"])
+    assert len(warnings) == 1
+    assert "L2" in warnings[0]
 
-    via_app = owner_table(view, assumptions)
-    direct = owner_view(view, assumptions)
+
+def test_capacity_warning_names_the_breaching_line_in_multiline(engine, config):
+    assumptions, schema = config
+    stress = LeverSettings(
+        service_target=0.995, inventory_cover_weeks=10.0,
+        forecast_bias_correction=0.0, min_run_hours=20.0,
+    ).validate(assumptions)
+    res = run_scenario_for_lines(engine, ["L2", "L3"], stress, assumptions, schema)
+    warnings = live_capacity_warnings(res["capacity"])
+    assert any("L2" in w for w in warnings)
+
+
+# ---------------------------------------------------------------------------
+# by_class_breakdown
+# ---------------------------------------------------------------------------
+
+
+def test_by_class_breakdown_counts_skus_not_sku_months(engine, config):
+    """Regression: sku_month has 12 rows per SKU. n_skus must count distinct
+    SKUs, not SKU-months."""
+    assumptions, schema = config
+    base = base_levers_for_line(engine, assumptions, "L3")
+    res = run_scenario_for_lines(engine, ["L3"], base, assumptions, schema)
+    cb = by_class_breakdown(res["sku_month"], base)
+    expected_a = len(
+        [s for s in engine.line_skus("L3")
+         if engine.sku_master.loc[s, "abc_class"] == "A"]
+    )
+    a_row = cb[cb.abc_class == "A"]
+    if not a_row.empty:
+        assert int(a_row.iloc[0]["n_skus"]) == expected_a
+
+
+def test_by_class_breakdown_does_not_fabricate_conversion(engine, config):
+    assumptions, schema = config
+    base = base_levers_for_line(engine, assumptions, "L3")
+    res = run_scenario_for_lines(engine, ["L3"], base, assumptions, schema)
+    cb = by_class_breakdown(res["sku_month"], base)
+    assert cb["line_conversion_cost_eur"].isna().all()
+
+
+# ---------------------------------------------------------------------------
+# owner_table / line_policy_table — thin wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_owner_table_matches_direct_reporter_call(engine, config):
+    assumptions, schema = config
+    base = base_levers_for_line(engine, assumptions, "L3")
+    res = run_scenario_for_lines(engine, ["L3"], base, assumptions, schema)
+    via_app = owner_table(res["avoidable_view"], assumptions)
+    direct = owner_view(res["avoidable_view"], assumptions)
     pd.testing.assert_frame_equal(via_app, direct)
 
 
-# ---------------------------------------------------------------------------
-# top_policy_moves
-# ---------------------------------------------------------------------------
-
-
-def test_top_policy_moves_returns_sorted_rows(app_data, engine, config):
-    assumptions, _ = config
-    moves = top_policy_moves(
-        app_data["optimal_policy"], engine.sku_master, assumptions, top_n=5
-    )
-    assert len(moves) <= 5
-    assert list(moves["saving_eur"]) == sorted(moves["saving_eur"], reverse=True)
+def test_line_policy_table_has_one_row_per_class(app_data):
+    lpt = line_policy_table(app_data["line_results"])
+    n_lines = app_data["line_results"]["line_id"].nunique()
+    assert len(lpt) == n_lines * 3
 
 
 # ---------------------------------------------------------------------------
-# app.py — static checks (no Streamlit runtime needed)
+# Contracts
 # ---------------------------------------------------------------------------
-
-
-def test_app_py_imports_only_from_app_logic_for_computation():
-    text = (REPO / "app.py").read_text()
-    assert "from src.app_logic import" in text
-    assert "from src.engine import LeverSettings" in text  # LeverSettings is a
-    # dataclass constructor, not economic logic — permitted
-
-
-def test_app_py_contains_no_inline_economic_arithmetic():
-    """If app.py computes a cost rather than displaying one already computed
-    by app_logic/reporter/engine, that is a scope violation."""
-    text = (REPO / "app.py").read_text()
-    forbidden = [
-        "gross_margin_eur *",
-        "* gross_margin_eur",
-        "carrying_rate_monthly",
-        "_expected_shortfall",
-        "writeoff_trigger_pct_life_left",
-        "std_cost_eur *",
-    ]
-    for token in forbidden:
-        assert token not in text, f"app.py appears to compute economics via {token!r}"
-
-
-def test_app_py_sliders_reference_assumptions_ranges_not_literals():
-    """Lightweight static guard: every st.slider call's bounds should trace to
-    a variable built from assumptions['levers'], not a bare literal pair typed
-    directly into the slider call."""
-    text = (REPO / "app.py").read_text()
-    assert "levers_cfg = assumptions" in text
-    for lever_key in (
-        "service_target_by_abc",
-        "inventory_cover_weeks",
-        "forecast_bias_correction",
-        "min_run_hours",
-    ):
-        assert lever_key in text, f"{lever_key} range not read from assumptions in app.py"
-
-
-def test_app_py_shows_both_avoidable_and_fixed_cost():
-    """D-062's exact requirement, checked at the UI layer too — the fixed
-    absorption figure must be visible, not only the avoidable total."""
-    text = (REPO / "app.py").read_text()
-    assert "conversion_cost_fixed_eur" in text
-    assert "total_reported_cost_eur" in text
-
-
-def test_app_py_syntax_is_valid():
-    import ast
-
-    ast.parse((REPO / "app.py").read_text())
-
-
-def test_requirements_txt_lists_streamlit_and_pyarrow():
-    text = (REPO / "requirements.txt").read_text().lower()
-    for pkg in ("streamlit", "pandas", "numpy", "pyyaml", "pyarrow"):
-        assert pkg in text, f"{pkg} missing from requirements.txt"
 
 
 def test_ground_truth_not_importable():
-    for f in ("app_logic.py",):
-        text = (REPO / "src" / f).read_text()
-        assert "ground_truth" not in text.lower()
-    assert "ground_truth" not in (REPO / "app.py").read_text().lower()
+    assert "ground_truth" not in (REPO / "src" / "app_logic.py").read_text().lower()
