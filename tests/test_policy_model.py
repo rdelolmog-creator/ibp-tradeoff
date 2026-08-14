@@ -28,6 +28,11 @@ from src.engine import LeverSettings, TradeOffEngine, build_line_master  # noqa:
 from src.policy_model import (  # noqa: E402
     ATTRIBUTE_FEATURES,
     optimise_all_lines,
+    joint_policy_grid,
+    search_joint_policy,
+    best_feasible_policy,
+    search_all_lines,
+    expand_to_sku_level,
     HISTORY_DERIVED_FEATURES,
     TARGETS,
     PolicyModel,
@@ -327,3 +332,94 @@ def test_separable_is_the_default_attribution(optimiser):
 
 def test_ground_truth_not_importable():
     assert "ground_truth" not in (REPO / "src" / "policy_model.py").read_text()
+
+
+# ---------------------------------------------------------------------------
+# D-071 — joint per-class search
+# ---------------------------------------------------------------------------
+
+
+def test_every_candidate_is_a_real_joint_simulation(engine, assumptions):
+    """Spot-check: manually run_scenario() the winning row's exact per-class
+    LeverSettings and assert its totals match the search result's row
+    exactly — proves the search tabulates real simulations, not estimates."""
+    cover, service = joint_policy_grid(assumptions, n=2)
+    search = search_joint_policy(engine, "L3", cover, service)
+    row = search.iloc[0]
+    levers = LeverSettings(
+        service_target={"A": row.service_A, "B": row.service_B, "C": row.service_C},
+        inventory_cover_weeks={"A": row.cover_A, "B": row.cover_B, "C": row.cover_C},
+        forecast_bias_correction=row.bias_correction,
+        min_run_hours=row.min_run_hours,
+    ).validate(assumptions)
+    direct = engine.run_scenario("L3", levers)
+    assert direct.totals["total_economic_cost_eur"] == pytest.approx(
+        row.total_economic_cost_eur, rel=1e-9
+    )
+
+
+def test_best_feasible_excludes_infeasible_rows():
+    search = pd.DataFrame(
+        [
+            {"total_economic_cost_eur": 100.0, "capacity_shortfall_total": 500.0},
+            {"total_economic_cost_eur": 200.0, "capacity_shortfall_total": 0.0},
+        ]
+    )
+    best = best_feasible_policy(search)
+    assert best["total_economic_cost_eur"] == 200.0
+
+
+def test_raises_when_nothing_in_the_grid_is_feasible():
+    search = pd.DataFrame(
+        [
+            {"total_economic_cost_eur": 100.0, "capacity_shortfall_total": 50.0},
+            {"total_economic_cost_eur": 200.0, "capacity_shortfall_total": 10.0},
+        ]
+    )
+    with pytest.raises(PolicyModelViolation):
+        best_feasible_policy(search)
+
+
+def test_sku_inherits_its_own_class_and_line_policy(engine, assumptions):
+    lr = search_all_lines(engine, n=2)
+    sku_level = expand_to_sku_level(lr, engine)
+    lr_ix = lr.set_index("line_id")
+    for _, row in sku_level.iterrows():
+        expected_cover = lr_ix.loc[row.line_id, f"cover_{row.abc_class}"]
+        expected_service = lr_ix.loc[row.line_id, f"service_{row.abc_class}"]
+        assert row.cover_weeks == pytest.approx(expected_cover)
+        assert row.service_target == pytest.approx(expected_service)
+
+
+def test_saving_is_measured_against_the_uniform_default(engine, assumptions):
+    lr = search_all_lines(engine, n=2)
+    row = lr[lr.line_id == "L3"].iloc[0]
+    category = str(
+        engine.sku_master.loc[engine.line_skus("L3")[0], "category"]
+    )
+    default_levers = LeverSettings.defaults_per_class(assumptions, category)
+    direct = engine.run_scenario("L3", default_levers)
+    assert row["default_total_cost_eur"] == pytest.approx(
+        direct.totals["total_economic_cost_eur"], rel=1e-9
+    )
+
+
+def test_conversion_cost_is_a_line_total_not_a_per_sku_split(engine, assumptions):
+    lr = search_all_lines(engine, n=2)
+    sku_level = expand_to_sku_level(lr, engine)
+    for line_id, g in sku_level.groupby("line_id"):
+        assert g["line_conversion_cost_eur"].nunique() == 1, (
+            f"{line_id}: conversion cost varies per SKU — it should be an "
+            f"identical line total, not silently re-attributed per SKU"
+        )
+
+
+def test_optimum_never_worse_than_the_true_per_class_default(engine, assumptions):
+    """D-067's failure mode, recurring one level up if left unguarded."""
+    lr = search_all_lines(engine, n=2)
+    assert float(lr["saving_eur"].min()) >= -1e-6
+
+
+def test_optimal_result_is_always_capacity_feasible(engine, assumptions):
+    lr = search_all_lines(engine, n=2)
+    assert (lr["capacity_shortfall_total"] <= 1e-6).all()

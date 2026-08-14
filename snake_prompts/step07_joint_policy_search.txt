@@ -1,0 +1,186 @@
+SNAKE PROMPT — STEP 7 REDO, JOINT PER-CLASS POLICY SEARCH
+IBP Trade-Off Engine · Week 6 Capstone · AI Finance Accelerator
+
+Redoes Step 7 on top of D-071's engine change. Retracts D-068's €622,610
+figure: it was assembled from separate uniform-line runs with no combined
+capacity check. This prompt makes "optimal" mean what it says — one jointly
+simulated, capacity-feasible policy, found by search rather than assembled
+after the fact.
+
+
+-------------------------------------------------------------------------------
+S — SPECIFY FILE TYPE AND DATA SOURCE
+-------------------------------------------------------------------------------
+
+Modified: src/policy_model.py, tests/test_policy_model.py
+Consumed, unchanged: src/engine.py (D-071's per-class LeverSettings)
+Superseded, not deleted: the existing PolicyOptimiser.optimise() /
+  optimise_all_lines() path (the old per-SKU-isolated search). Left in place
+  because Step 9/10 still reference its output shape until they are migrated
+  in their own follow-up prompts. The new path is what actually gets used;
+  the old path is legacy pending removal once Step 9/10 catch up.
+
+
+-------------------------------------------------------------------------------
+N — NOTE THE ENVIRONMENT
+-------------------------------------------------------------------------------
+
+Same as before. Built and tested against the real repo on branch
+engine-per-class-levers.
+
+RUNTIME BUDGET, stated up front because it drives the scope decision below:
+a full joint search over cover x service, 3 classes, n=3 values each, is
+3^6 = 729 combinations. A single run_scenario() call is ~63ms (measured,
+Step 8), so 729 calls is ~46s per line, ~3 minutes for all four lines. This
+is the ceiling the search design below is built to respect.
+
+
+-------------------------------------------------------------------------------
+A — ACTION TO PERFORM
+-------------------------------------------------------------------------------
+
+SCOPE DECISION, stated explicitly rather than silently narrowed:
+this search jointly optimises inventory_cover_weeks and service_target PER
+CLASS (the two levers whose per-SKU-isolated treatment was the actual defect
+found and retracted in D-071). forecast_bias_correction and min_run_hours are
+held at fixed scalars DURING THE SEARCH — not because the engine can't do
+per-class values for them (it can, as of D-071's Step 6 change), but because
+searching all four levers per class simultaneously is 3^12 combinations,
+computationally infeasible in the remaining time for marginal expected
+benefit: cover is what drives batch size and therefore aggregate workload,
+which is where the capacity-feasibility bug actually lived. Widening the
+search to all four levers per class is a legitimate future extension, not
+attempted here.
+
+In src/policy_model.py:
+
+  def joint_policy_grid(assumptions, n=3) -> tuple[list[float], list[float]]
+      n values per lever from assumptions.levers.*.range — same principle as
+      every prior grid, no literals.
+
+  def search_joint_policy(
+      engine, line_id, cover_values, service_values,
+      bias_correction=0.0, min_run_hours=None
+  ) -> pd.DataFrame
+      Full factorial over (cover_A, cover_B, cover_C, service_A, service_B,
+      service_C) — 3^6 combinations at n=3. min_run_hours defaults to the
+      line's category default (read from config, not a literal) if not
+      given; bias_correction defaults to 0.0. EACH combination is ONE REAL
+      run_scenario() call with a full per-class LeverSettings — this is the
+      entire fix: every candidate is genuinely, jointly simulated, so its
+      capacity_shortfall_total is the TRUE aggregate answer for that exact
+      combination, not an inference from separate runs.
+      Returns one row per combination: the six per-class lever values, all
+      four economic outputs, total_economic_cost_eur,
+      capacity_shortfall_total, and utilisation_max.
+
+  def best_feasible_policy(search_result) -> pd.Series
+      FILTERS to capacity_shortfall_total <= 1e-6 first, THEN picks the
+      minimum total_economic_cost_eur among the feasible rows. This ordering
+      is the whole point: infeasible-but-cheap combinations are never
+      eligible, so whatever this returns is a plan that could actually run.
+      Raises PolicyModelViolation if NO row in the search is feasible — that
+      is itself a finding (the grid's range cannot satisfy capacity anywhere)
+      and must not be silently swallowed by returning the least-bad
+      infeasible point.
+
+  def search_all_lines(engine, n=3, bias_correction=0.0) -> pd.DataFrame
+      Runs search_joint_policy + best_feasible_policy for every line, using
+      each line's own category default for min_run_hours. Returns one row per
+      line: the winning per-class cover/service values, the four outputs,
+      total cost, and a `default_total_cost_eur` column for comparison — the
+      default being each line's UNIFORM class-blind policy (today's
+      LeverSettings.defaults(), scalar, class "A"), evaluated once as the
+      baseline every optimum is measured against. saving_eur = default - best.
+
+  def expand_to_sku_level(line_results, engine) -> pd.DataFrame
+      For each line's winning combination, re-reads that ALREADY-COMPUTED
+      scenario's sku_month (do not re-simulate — the winning row's per-SKU
+      lost_sales_eur / excess_obsolescence_eur / working_capital_cost_eur
+      come directly from the one joint simulation that produced it). Every
+      SKU in a class inherits that class's chosen cover/service — this is not
+      an approximation, it is what "policy set by class" means. Conversion
+      cost is NOT split per SKU here — it stays a line total, displayed
+      separately, labelled as such (D-066's finding that it isn't separable
+      per SKU still holds; the difference is this file no longer PRETENDS a
+      per-SKU split is a policy result). Output: sku_id, line_id, abc_class,
+      cover_weeks, service_target (both inherited from the line's winning
+      combination), lost_sales_eur, excess_obsolescence_eur,
+      working_capital_cost_eur, line_conversion_cost_eur (repeated per SKU on
+      that line, explicitly labelled a line total not a per-SKU figure).
+
+PolicyModel (the ML fitting class) is updated to consume
+expand_to_sku_level()'s output instead of the old optimise_all_lines() output.
+Expect and REPORT plainly, not hide: with policy now set at class level, the
+target values cluster into at most 3 x 4 = 12 distinct (cover, service) pairs
+across 60 SKUs. SHAP finding abc_class as the dominant driver (already true in
+the original Step 7 run) is now the EXPECTED, mechanistically correct result,
+not a surprising one — the model is very nearly recovering class membership
+because policy is, by this design, set by class. State this plainly in the
+notebook rather than treating it as a weak result to explain away.
+
+TESTS — extend tests/test_policy_model.py:
+
+  test_every_candidate_is_a_real_joint_simulation
+      spot-check: manually run_scenario() the winning row's exact per-class
+      LeverSettings and assert its totals match the search result's row
+      exactly — proves the search isn't approximating, it's tabulating real
+      simulations.
+  test_best_feasible_excludes_infeasible_rows
+      construct a search result with a cheap-but-infeasible row (shortfall>0)
+      and a more expensive feasible row; assert best_feasible_policy returns
+      the feasible one, not the cheap one.
+  test_raises_when_nothing_in_the_grid_is_feasible
+      a grid where every candidate breaches capacity (e.g. cover forced to
+      the top of the range for all three classes on a tight line) must raise,
+      not silently return an infeasible "best".
+  test_sku_inherits_its_own_class_and_line_policy
+      every SKU's cover_weeks/service_target in expand_to_sku_level's output
+      matches its own abc_class's value in that SKU's line's winning row.
+  test_saving_is_measured_against_the_uniform_default
+      default_total_cost_eur equals a direct run_scenario() call using
+      LeverSettings.defaults() (scalar, class A) for that line.
+  test_conversion_cost_is_a_line_total_not_a_per_sku_split
+      every SKU on a line shows the IDENTICAL line_conversion_cost_eur value
+      — proves it was not silently re-attributed per SKU.
+
+Every existing Step 6/7/8 test must still pass unmodified.
+
+
+-------------------------------------------------------------------------------
+K — KEY DATA STRUCTURE
+-------------------------------------------------------------------------------
+
+search_all_lines() output — one row per line, THE feasible optimum:
+
+  line_id  cover_A  cover_B  cover_C  service_A  service_B  service_C  lost_sales_eur  excess_obsolescence_eur  working_capital_cost_eur  conversion_cost_eur  total_economic_cost_eur  default_total_cost_eur  saving_eur  capacity_shortfall_total  utilisation_max
+  L3       3.5      2.5      1.5      0.995      0.95       0.88       19100.3          109300.1                 88700.5                    163100.2               380201.1                  409000.0                 28798.9      0.0                        0.71
+
+expand_to_sku_level() output — one row per SKU, inherited policy:
+
+  sku_id  line_id  abc_class  cover_weeks  service_target  lost_sales_eur  excess_obsolescence_eur  working_capital_cost_eur  line_conversion_cost_eur
+  A-05    L3       A          3.5          0.995            1204.3          6301.2                    5890.1                     163100.2
+  A-08    L3       A          3.5          0.995            980.1           5200.4                    5102.3                     163100.2
+
+Illustrative shape only. MAGNITUDES ARE NOT FINDINGS (§10) — expect these
+numbers to differ from D-068's retracted figures, possibly materially, because
+this is the first time capacity has genuinely constrained the search.
+
+
+-------------------------------------------------------------------------------
+E — EXTRA DETAILS
+-------------------------------------------------------------------------------
+
+- src/engine.py is NOT modified — this consumes D-071's change, does not
+  extend it.
+- No hard-coded class names, line ids, or grid values — n and ranges come
+  from assumptions.levers.*.range as always.
+- The old PolicyOptimiser path is left in the file, unremoved, but its output
+  must not be presented as the current answer anywhere in the notebook. The
+  notebook uses search_all_lines() / expand_to_sku_level() exclusively.
+- If the true joint-feasible saving comes out smaller than D-068's retracted
+  €622,610 — or larger — report the real number. The point of this redo is
+  that the number is finally trustworthy, not that it lands anywhere
+  particular.
+- Nothing is final until it has run in Colab and been confirmed by the
+  reviewer's own run (D-037).
