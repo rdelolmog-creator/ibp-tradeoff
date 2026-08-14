@@ -1,0 +1,244 @@
+# config/assumptions_lowcensoring.yaml
+# IBP Trade-Off Engine — CONTROL VARIANT of the assumption set.
+#
+# Identical to assumptions.yaml in every respect except abc.*.target_cover_weeks.
+# Purpose (D-017): isolate censoring as the cause of bias-recovery error. Higher
+# cover suppresses stockouts, so shipped volume ceases to be a censored
+# observation of demand. Censoring falls 6.16% -> 1.57%.
+#
+# Cover is the deliberate lever here rather than demand_noise_cv, because noise CV
+# drives BOTH distortions (censoring AND the (sd^2-sf^2)/2 variance asymmetry).
+# Changing it would confound the two and the control would prove nothing.
+#
+# This file is NOT the modelled world. assumptions.yaml is. This exists only so the
+# identical Step 5 estimator can be run against a low-censoring counterfactual.
+# Step 0 (Foundations). Every economic output must trace to a key in this file.
+#
+# PROVENANCE: ranges proposed by a GPT prompted for EMEA FMCG plausibility,
+# then corrected here. These are ASSUMPTIONS, not facts. Confidence labels are
+# carried through deliberately — they feed the limitations slide.
+# Per §10: magnitudes are not findings. The method is the deliverable.
+
+meta:
+  assumptions_version: 0.1
+  currency: EUR
+  seed: 20260807          # single seed governs all stochastic draws
+
+# ---------------------------------------------------------------------------
+# CALIBRATION — top-down sizing. Set FIRST, then everything else back-solves.
+# Prevents the volume/absorption mismatch in the raw parameter table.
+# ---------------------------------------------------------------------------
+calibration:
+  target_annual_net_sales_eur: 200_000_000   # ~3 plants, 4 lines, 60 SKUs
+  target_line_utilisation: 0.85              # capacity MUST bind or MOQ and
+                                             # min-run levers go inert
+  validation_checks:
+    conversion_cost_pct_of_cogs: [0.12, 0.25]  # if outside, recalibrate
+    forecast_mape_by_abc_lag1:                 # EMERGENT, not an input
+      A: [0.10, 0.18]
+      B: [0.18, 0.30]
+      C: [0.30, 0.50]
+    stockout_split_sums_to_one: true
+    stock_rollforward_ties: true
+
+# ---------------------------------------------------------------------------
+# FINANCE
+# ---------------------------------------------------------------------------
+finance:
+  wacc_annual: 0.09                  # range 0.07-0.11 | confidence: medium
+  carrying_rate_monthly: 0.0075      # wacc / 12; ONLY this enters the total
+  fx:
+    gbp_eur: 1.16                    # range 1.10-1.22 | confidence: LOW
+                                     # synthetic corridor only, not a rate view
+
+# ---------------------------------------------------------------------------
+# CATEGORIES — deliberately differentiated so all four outputs bind (D-008)
+# ---------------------------------------------------------------------------
+categories:
+
+  ambient:
+    seasonality_amplitude: 0.15      # +/- vs deseasonalised baseline | medium
+    seasonality_phase_months: 0
+    annual_trend: 0.005              # medium
+    promo_events_per_sku_year: 6     # medium
+    promo_uplift_multiplier: 1.6     # medium
+    gross_margin_pct: 0.33           # range 0.25-0.42 | medium
+    net_price_eur_per_unit: 2.50     # range 1.0-5.0 | confidence: LOW
+    shelf_life_weeks: 65             # range 39-104 | medium
+    writeoff_trigger_pct_life_left: 0.18   # range 0.10-0.25 | LOW
+    line_speed_units_hr: 6_000       # BOTTOM of 6k-25k range, see calibration
+    changeover_hours: 2.0            # medium
+    changeover_cash_eur: 1_000       # LOW — excludes lost capacity, which is
+                                     # monetised via hours + overtime
+    min_run_hours: 7                 # medium
+    yield_rate: 0.985                # medium
+
+  chilled:
+    seasonality_amplitude: 0.20
+    seasonality_phase_months: 4
+    annual_trend: 0.02
+    promo_events_per_sku_year: 5
+    promo_uplift_multiplier: 1.4
+    gross_margin_pct: 0.29           # range 0.20-0.38 | medium
+    net_price_eur_per_unit: 2.30     # LOW
+    shelf_life_weeks: 6              # range 2-12 | medium — this short life is
+                                     # what makes the obsolescence leg live
+    writeoff_trigger_pct_life_left: 0.30   # LOW
+    line_speed_units_hr: 4_500
+    changeover_hours: 3.0
+    changeover_cash_eur: 1_500       # LOW
+    min_run_hours: 6
+    yield_rate: 0.97
+
+  personal_care:
+    seasonality_amplitude: 0.10
+    seasonality_phase_months: 8
+    annual_trend: 0.02
+    promo_events_per_sku_year: 7
+    promo_uplift_multiplier: 1.7
+    gross_margin_pct: 0.52           # range 0.40-0.65 | medium
+    net_price_eur_per_unit: 5.50     # LOW
+    shelf_life_weeks: 156            # obsolescence near-inert here, by design
+    writeoff_trigger_pct_life_left: 0.10   # LOW
+    line_speed_units_hr: 3_500
+    changeover_hours: 3.5
+    changeover_cash_eur: 1_750       # LOW
+    min_run_hours: 9
+    yield_rate: 0.98
+
+# ---------------------------------------------------------------------------
+# ABC CLASSES
+# ---------------------------------------------------------------------------
+abc:
+  A:
+    sku_count_share: 0.20            # high confidence
+    volume_share: 0.72               # high
+    demand_noise_cv: 0.12            # high
+    target_cover_weeks: 12.0         # CONTROL: 4.0 in assumptions.yaml
+    service_floor: 0.985             # LEVER default | range 0.97-0.995 | high
+  B:
+    sku_count_share: 0.30
+    volume_share: 0.20
+    demand_noise_cv: 0.22
+    target_cover_weeks: 12.0   # CONTROL: 4.0 in assumptions.yaml
+    service_floor: 0.96
+  C:
+    sku_count_share: 0.50
+    volume_share: 0.08
+    demand_noise_cv: 0.35
+    target_cover_weeks: 14.0   # CONTROL: 6.0 in assumptions.yaml
+    service_floor: 0.93
+
+# ---------------------------------------------------------------------------
+# FORECAST BEHAVIOUR
+# Chronic bias is a MECHANISM (planner behaviour), drawn ONCE and held across
+# all 36 months. Random error is redrawn monthly. MAPE emerges from the two.
+# This is what makes the decomposition recoverable rather than tautological:
+# the model is never told the split, it must infer it, and recovery accuracy
+# is the validation. Magnitudes recovered are whatever is encoded here (§10).
+# ---------------------------------------------------------------------------
+forecast:
+  lags_months: [1, 2, 3]
+
+  chronic_bias:
+    structure: category_level_plus_sku_idiosyncratic
+    persistence: fixed_over_full_history      # NOT redrawn monthly
+    by_category:                              # signed; + = over-forecast
+      ambient: 0.00                           # control group: no chronic bias
+      chilled: -0.07                          # under-forecasts persistently
+      personal_care: 0.05                     # commercial optimism
+    sku_idiosyncratic_sd_by_abc:
+      A: 0.02
+      B: 0.04
+      C: 0.06
+    lag_amplification: [1.0, 1.4, 1.8]        # bias grows with horizon
+
+  random_error_cv_by_abc:                     # redrawn each month
+    A: [0.09, 0.13, 0.16]                     # by lag 1/2/3
+    B: [0.16, 0.21, 0.26]
+    C: [0.26, 0.33, 0.41]
+
+  promo_periods_excluded_from_bias_estimation: true
+
+# ---------------------------------------------------------------------------
+# PLANTS AND LINES
+# ---------------------------------------------------------------------------
+plants:
+  PLANT1: {source_system: A, currency: EUR, role: main_multi_category}
+  PLANT2: {source_system: A, currency: EUR, role: second_site}
+  PLANT3: {source_system: B, currency: GBP, role: unmigrated_acquisition}
+
+lines:
+  L1: {plant: PLANT1, category: ambient,       equipment_age_years: 12, complexity_index: 1.0}
+  L2: {plant: PLANT1, category: chilled,       equipment_age_years: 6,  complexity_index: 1.3}
+  L3: {plant: PLANT2, category: personal_care, equipment_age_years: 9,  complexity_index: 1.1}
+  L4: {plant: PLANT3, category: ambient,       equipment_age_years: 18, complexity_index: 0.8}
+  # Ambient on two lines across two plants is deliberate: it creates a real
+  # allocation question rather than a fixed SKU-to-line mapping.
+
+plant_economics:
+  scheduled_hours_per_line_month: 520     # range 350-650 | medium
+  labour_rate_eur_hr: 32                  # range 20-45 | confidence: LOW
+  overtime_premium_pct: 0.50              # range 0.25-0.75 | medium
+  fixed_absorption_eur_line_month: 300_000  # raw table said 220k; raised to
+                                            # land conversion cost inside the
+                                            # 12-25% of COGS check | LOW
+  schedule_adherence: 0.92                # range 0.85-0.96 | medium
+  overtime_step_hours: 40                 # overtime bought in blocks, not
+                                          # continuously — creates a step cost
+  max_overtime_hours_month: 80
+
+# ---------------------------------------------------------------------------
+# INVENTORY RISK — the "excess / slow-moving" half of output 2 (architecture
+# §2 names it "Excess / slow-moving risk", which is wider than shelf-life
+# obsolescence). Without this term the output is structurally dead on any
+# long-shelf-life category inside a 12-month horizon: personal care's write-off
+# trigger cannot fire before month 32. Added at Step 6 (D-047).
+# ---------------------------------------------------------------------------
+inventory_risk:
+  excess_cover_months_threshold: 4.0   # stock beyond this many months of plan
+                                       # is slow-moving | range 3-9 | LOW
+  excess_provision_pct: 0.25           # share of that excess provisioned at
+                                       # standard cost | range 0.10-0.50 | LOW
+
+# ---------------------------------------------------------------------------
+# LEVERS — the four decision points. Defaults above; slider ranges here.
+# ---------------------------------------------------------------------------
+levers:
+  service_target_by_abc:
+    range: [0.88, 0.995]
+    owner: "Supply Chain / Demand Planning"
+  inventory_cover_weeks:
+    range: [1.0, 10.0]
+    owner: "Supply Chain Planning"
+  forecast_bias_correction:
+    range: [0.0, 1.0]                     # share of detected chronic bias removed
+    owner: "Demand Planning / Commercial"
+  min_run_hours:
+    range: [2.0, 20.0]
+    owner: "Supply Chain Planning / Plant"
+
+# ---------------------------------------------------------------------------
+# STOCKOUT DISPOSITION — must sum to 1.0. Lost share is a LIVE SLIDER (§10):
+# valuing 100% of shortfall at full GM overstates the cost of low service and
+# biases the tool toward too much inventory — the exact error it exists to fix.
+# ---------------------------------------------------------------------------
+stockout_disposition:
+  ambient:       {lost: 0.40, substituted: 0.45, backordered: 0.15}   # LOW
+  chilled:       {lost: 0.35, substituted: 0.55, backordered: 0.10}   # LOW
+  personal_care: {lost: 0.50, substituted: 0.35, backordered: 0.15}   # LOW
+  lost_share_slider_range: [0.15, 0.75]
+
+# ---------------------------------------------------------------------------
+# GUARDRAILS — enforced in code, not just documented. Violating any of these
+# makes the model circular and invalidates the project (§9).
+# ---------------------------------------------------------------------------
+guardrails:
+  no_direct_forecast_error_to_cost_coefficient: true
+  no_direct_forecast_error_to_writeoff_coefficient: true
+  conversion_cost_emerges_from: [run_length, changeover_count, absorption,
+                                 overtime, yield, schedule_adherence]
+  obsolescence_emerges_from: [inventory_ageing, shelf_life, writeoff_trigger]
+  working_capital_formula: "inventory_value_eur * wacc_annual / 12"
+  suspicious_r2_threshold: 0.95   # cost model R2 above this = investigate
+                                  # for leakage before believing it
