@@ -357,5 +357,16 @@ DECISION: the `app_data/line_results.csv` and `sku_level.csv` committed in D-073
 
 Sandbox's `data_primary/clean/demand_characteristics.csv` and `censoring_diagnostics.csv` were overwritten with the real files at the source, and `search_all_lines(n=3)` was re-run end to end (206s). Corrected total saving vs true per-class default: **EUR 615,470** (previously reported, on contaminated data: EUR 619,889 — a ~4.4k difference, not large, but the contaminated figure was never the number to trust regardless of magnitude). All four lines remain fully capacity-feasible at the corrected optimum. App re-verified via AppTest against the corrected `app_data/` — clean, 132/132 tests.
 
+**D-075 · Colab notebooks rebuilt for Steps 7 and 9; a second contamination catch in committed Step 8 data**
+DECISION: `step07_policy_model.ipynb` and `step09_reporter.ipynb` were still calling retired functions (`optimise_all_lines()`, the deleted `policy_brief()`) — Step 9's notebook would have crashed outright on import. Both rebuilt against `search_all_lines()`/`expand_to_sku_level()`/`line_policy_brief()`/`class_breakdown_view()`. `step06_mvd_engine.ipynb` needed no change — it only uses scalar `LeverSettings.defaults()`, which D-071 kept fully backward compatible.
+
+A new function, `sku_level_for_policy_model()`, reshapes `expand_to_sku_level()`'s output into the column names `PolicyModel` (the ML/SHAP half of Step 7) still expects — `PolicyModel`'s own logic is unaffected by D-071 and was not rewritten, only the column names feeding it. `edge_optimum_flag` is set `False` for every row: the old flag existed because the retired per-SKU search commonly landed on grid boundaries as an artefact of attributing a uniform-line run to one SKU; these rows are genuinely joint-optimal, feasibility-filtered points, so there is no reason to exclude any of them from training.
+
+**Honest, expected result surfaced by the rebuilt notebook, not hidden:** `optimal_cover_weeks`'s naive-baseline MAE is exactly 0.0 in this run — the n=3 grid found the same corner solution optimal on every line, so cover is literally constant within each class across the whole portfolio, and no model can beat a baseline that is already exact. Reported as what it is, not smoothed over.
+
+**A second contamination catch, same root cause as D-074:** `app_data/step08_portfolio_summary.csv` and `step08_lever_consistency.csv` were ALSO built from the sandbox's earlier-contaminated data, giving 8 of 20 inconsistent lever/output pairs instead of the real 4 — caught by comparing the rebuilt Step 9 notebook's `portfolio_brief()` output against the number already confirmed from the user's actual Step 8 Colab run. Both files recovered from `main`, where the user's genuine Step 8 upload had already been committed during the original Step 10 build. Re-verified: `portfolio_brief()` now reports "4 of 20 ... concentrated in: inventory_cover_weeks, min_run_hours, service_target" — `forecast_bias_correction` correctly absent, confirming D-069 held.
+
+Both rebuilt notebooks executed end to end in the sandbox (Step 7: ~340s including its own test suite; Step 9: fast, reusing Step 7's cached search result) with all consolidated-report checks PASS. 132/132 tests across every module; `app.py` re-verified via `AppTest` against the fully corrected `app_data/`.
+
 
 *(pending)*

@@ -631,6 +631,33 @@ def expand_to_sku_level(
     return pd.DataFrame(rows)
 
 
+def sku_level_for_policy_model(sku_level: pd.DataFrame) -> pd.DataFrame:
+    """Reshapes expand_to_sku_level()'s output into what PolicyModel expects.
+
+    PolicyModel (Part 2, below) was built against the RETIRED per-SKU search
+    and still reads column names optimal_cover_weeks / optimal_service_target
+    — kept as-is rather than renamed throughout, since PolicyModel's own
+    logic (feature assembly, LOO evaluation, SHAP) is unaffected by D-071 and
+    does not need to change, only the column names feeding it do.
+
+    edge_optimum_flag is set False for every row: the OLD flag existed
+    because the retired per-SKU search commonly landed on grid boundaries as
+    an ARTEFACT of attributing a uniform-line run to one SKU. These rows are
+    genuinely joint-optimal, feasibility-filtered points — a class value
+    sitting at the edge of the tested range here means the constraint
+    binds, not that the search failed, so there is no reason to exclude
+    these rows from training the way the old flag was designed to.
+    """
+    out = sku_level.rename(
+        columns={
+            "cover_weeks": "optimal_cover_weeks",
+            "service_target": "optimal_service_target",
+        }
+    ).copy()
+    out["edge_optimum_flag"] = False
+    return out
+
+
 # ---------------------------------------------------------------------------
 # PART 2 — the policy model
 # ---------------------------------------------------------------------------
