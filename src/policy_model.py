@@ -536,6 +536,109 @@ def best_feasible_three_lever(search_result: pd.DataFrame) -> pd.Series:
     return feasible.loc[feasible["total_economic_cost_eur"].idxmin()]
 
 
+def refine_with_candidate_set(
+    engine: TradeOffEngine, line_id: str, winner_row: Dict[str, Any],
+    exploration_cover_values: Sequence[float], exploration_bias_values: Sequence[float],
+    exploration_min_run_values: Sequence[float], tolerance_eur: float = 1.0,
+) -> pd.DataFrame:
+    """D-081. `search_all_lines_three_lever()`'s own grid (cover {1,5.5,10},
+    bias {0,.5,1,1}, min_run {4,6,9,12}) is not the only data available — a
+    WIDER exploratory grid (used for the dashboard's sliders) can contain
+    feasible points that beat the stored winner on a one-at-a-time curve,
+    simply because they were never tested by the narrower search grid. That
+    is not a capacity constraint excluding them (verify against
+    `capacity_shortfall_total`, not assumed) — it means the stored winner is
+    not the true argmin over the wider evaluated set.
+
+    This function does NOT sum one-at-a-time deltas (that repeats the same
+    additive-attribution error D-081's Task 2 corrected). It builds a
+    candidate set — the winner, plus every one-at-a-time improvement found
+    on the exploration grid, plus every JOINT combination of those
+    improvements — and evaluates each candidate as a real, independent
+    engine call. The argmin is taken over evaluated candidates only, never
+    interpolated or summed.
+
+    tolerance_eur guards against a real precision bug found during D-081:
+    curve data stored at 2 decimals compared against a full-precision
+    winning total made the winner appear to beat itself by fractions of a
+    cent. 1.0 (one euro) is safely above that noise floor and nowhere near
+    a real economic difference.
+    """
+    frozen_service = {
+        c: float(engine.assumptions["abc"][c]["service_floor"]) for c in ("A", "B", "C")
+    }
+    win_cover = {c: float(winner_row[f"cover_{c}"]) for c in ("A", "B", "C")}
+    win_bias, win_mrh = float(winner_row["bias_correction"]), float(winner_row["min_run_hours"])
+    win_total = float(winner_row["total_economic_cost_eur"])
+
+    def run(cover, bias, mrh):
+        levers = LeverSettings(
+            service_target=frozen_service, inventory_cover_weeks=cover,
+            forecast_bias_correction=bias, min_run_hours=mrh,
+        ).validate(engine.assumptions)
+        res = engine.run_scenario(line_id, levers)
+        shortfall = float(res.line_month["capacity_shortfall_units"].sum())
+        return round(float(res.totals["total_economic_cost_eur"]), 2), shortfall
+
+    # one-at-a-time curves, holding the OTHER four dimensions at the winner
+    improving: Dict[str, List[float]] = {}
+    for cls in ("A", "B", "C"):
+        alts = []
+        for cov in exploration_cover_values:
+            trial_cover = dict(win_cover); trial_cover[cls] = cov
+            total, _ = run(trial_cover, win_bias, win_mrh)
+            if total < win_total - tolerance_eur:
+                alts.append(cov)
+        improving[f"cover_{cls}"] = sorted(set(alts))
+    for bias in exploration_bias_values:
+        total, _ = run(win_cover, bias, win_mrh)
+        if total < win_total - tolerance_eur:
+            improving.setdefault("bias", []).append(bias)
+    improving.setdefault("bias", sorted(set(improving.get("bias", []))))
+    for mrh in exploration_min_run_values:
+        total, _ = run(win_cover, win_bias, mrh)
+        if total < win_total - tolerance_eur:
+            improving.setdefault("min_run", []).append(mrh)
+    improving.setdefault("min_run", sorted(set(improving.get("min_run", []))))
+
+    candidate_axes = {
+        "cover_A": sorted(set([win_cover["A"]] + improving.get("cover_A", []))),
+        "cover_B": sorted(set([win_cover["B"]] + improving.get("cover_B", []))),
+        "cover_C": sorted(set([win_cover["C"]] + improving.get("cover_C", []))),
+        "bias": sorted(set([win_bias] + improving.get("bias", []))),
+        "min_run": sorted(set([win_mrh] + improving.get("min_run", []))),
+    }
+    combos = list(itertools.product(*[candidate_axes[k] for k in
+                  ("cover_A", "cover_B", "cover_C", "bias", "min_run")]))
+
+    rows = []
+    for cov_a, cov_b, cov_c, bias, mrh in combos:
+        total, shortfall = run({"A": cov_a, "B": cov_b, "C": cov_c}, bias, mrh)
+        rows.append({
+            "line_id": line_id, "cover_A": cov_a, "cover_B": cov_b, "cover_C": cov_c,
+            "bias_correction": bias, "min_run_hours": mrh,
+            "total_economic_cost_eur": total, "capacity_shortfall_total": shortfall,
+            "is_original_winner": (
+                abs(cov_a - win_cover["A"]) < 1e-6 and abs(cov_b - win_cover["B"]) < 1e-6
+                and abs(cov_c - win_cover["C"]) < 1e-6 and abs(bias - win_bias) < 1e-6
+                and abs(mrh - win_mrh) < 1e-6
+            ),
+        })
+    return pd.DataFrame(rows)
+
+
+def best_evaluated_policy(candidates: pd.DataFrame) -> pd.Series:
+    """Argmin over evaluated candidates only, feasibility-first — same rule
+    as best_feasible_three_lever(), applied to refine_with_candidate_set()'s
+    output instead of the raw sweep grid."""
+    feasible = candidates[candidates["capacity_shortfall_total"] <= 1e-6]
+    if feasible.empty:
+        raise PolicyModelViolation(
+            "no candidate in the refined set is capacity-feasible"
+        )
+    return feasible.loc[feasible["total_economic_cost_eur"].idxmin()]
+
+
 def search_all_lines_three_lever(
     engine: TradeOffEngine, n_cover: int = 3,
     bias_values: Sequence[float] = (0.0, 0.5, 1.0),

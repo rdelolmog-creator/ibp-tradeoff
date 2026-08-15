@@ -26,6 +26,8 @@ sys.path.insert(0, str(REPO))
 
 from src.engine import LeverSettings, TradeOffEngine, build_line_master  # noqa: E402
 from src.policy_model import (  # noqa: E402
+    refine_with_candidate_set,
+    best_evaluated_policy,
     ATTRIBUTE_FEATURES,
     optimise_all_lines,
     joint_policy_grid,
@@ -497,3 +499,72 @@ def test_delta_vs_base_strips_fixed_absorption():
     r = delta_vs_base_view(row, base_total_eur=5108118.14, fixed_conversion_eur=3600000.0)
     assert r["avoidable_cost_eur"] == pytest.approx(900825.65, abs=0.01)
     assert r["delta_vs_base_eur"] < 0  # a real saving
+
+
+# ---------------------------------------------------------------------------
+# D-081 (retroactively formalised) — candidate-set re-selection
+# ---------------------------------------------------------------------------
+
+
+def test_refine_with_candidate_set_never_worse_than_winner(engine):
+    winner_row = {
+        "line_id": "L3", "cover_A": 5.5, "cover_B": 5.5, "cover_C": 5.5,
+        "bias_correction": 1.0, "min_run_hours": 9.0,
+        "total_economic_cost_eur": 4295523.85,
+    }
+    candidates = refine_with_candidate_set(
+        engine, "L3", winner_row, [1.0, 3.25, 5.5], [1.0], [9.0]
+    )
+    best = best_evaluated_policy(candidates)
+    assert best["total_economic_cost_eur"] <= winner_row["total_economic_cost_eur"] + 1e-6
+
+
+def test_refine_with_candidate_set_includes_original_winner(engine):
+    winner_row = {
+        "line_id": "L3", "cover_A": 5.5, "cover_B": 5.5, "cover_C": 5.5,
+        "bias_correction": 1.0, "min_run_hours": 9.0,
+        "total_economic_cost_eur": 4295523.85,
+    }
+    candidates = refine_with_candidate_set(
+        engine, "L3", winner_row, [5.5], [1.0], [9.0]
+    )
+    assert candidates["is_original_winner"].any()
+    assert len(candidates) == 1  # no exploration alternatives supplied
+
+
+def test_refine_with_candidate_set_all_feasible_and_capacity_checked(engine):
+    winner_row = {
+        "line_id": "L1", "cover_A": 5.5, "cover_B": 5.5, "cover_C": 1.0,
+        "bias_correction": 1.0, "min_run_hours": 6.0,
+        "total_economic_cost_eur": 4011794.88,
+    }
+    candidates = refine_with_candidate_set(
+        engine, "L1", winner_row, [1.0, 5.5], [1.0], [6.0]
+    )
+    assert "capacity_shortfall_total" in candidates.columns
+    assert (candidates["capacity_shortfall_total"] >= 0).all()
+
+
+def test_best_evaluated_policy_raises_when_all_infeasible():
+    df = pd.DataFrame([
+        {"total_economic_cost_eur": 100.0, "capacity_shortfall_total": 50.0},
+        {"total_economic_cost_eur": 200.0, "capacity_shortfall_total": 30.0},
+    ])
+    with pytest.raises(PolicyModelViolation):
+        best_evaluated_policy(df)
+
+
+def test_refine_with_candidate_set_tolerance_ignores_rounding_noise(engine):
+    """D-081's real bug: a winner compared against itself via a coarser-
+    precision curve point must not register as 'improving' due to rounding."""
+    winner_row = {
+        "line_id": "L1", "cover_A": 5.5, "cover_B": 5.5, "cover_C": 1.0,
+        "bias_correction": 1.0, "min_run_hours": 6.0,
+        "total_economic_cost_eur": 4011794.8775604647,  # full precision, as the real search returns
+    }
+    candidates = refine_with_candidate_set(
+        engine, "L1", winner_row, [5.5], [1.0], [6.0], tolerance_eur=1.0
+    )
+    # exactly one candidate (the winner tested against itself) — must not
+    # spuriously duplicate due to float rounding treating it as "improving"
+    assert len(candidates) == 1
