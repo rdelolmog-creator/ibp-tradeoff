@@ -403,5 +403,22 @@ Caught before running: `export_artefacts()`'s third parameter was still named an
 
 Notebook executed end to end in sandbox before push: 125 tests across five suites, all 7 consolidated-report checks PASS, `class_breakdown.csv` correctly absent from the export in favour of `delta_vs_base.csv`.
 
+**D-081 · Dashboard "Optimal" argmin corrected — Branch 2 (Task 1), sequential decomposition replaces additive attribution (Task 2), range-honesty and evidence citations added (Tasks 3-5)**
+DECISION: candidate-set construction uses a €1 tolerance rather than 1e-6, because curve data stored at two decimals compared against a full-precision winning total made winning points appear to beat themselves — confirmed on L4's cover_A=5.5 point (stored 4086831.59 vs full-precision 4086831.5946470266, a €0.0046 artefact, not a real second improving point).
+
+DECISION: the stored "Optimal" re-selected as the argmin over evaluated candidates (winner plus every one-at-a-time improvement plus every joint combination of those improvements, each a real engine call, capacity-checked) — not by summing one-at-a-time deltas, which would repeat the additive-attribution error being corrected. New totals, all capacity-feasible: L1 €4,007,875.52 (was €4,011,794.88), L2 €4,466,609.57 (was €4,500,825.65), L3 €4,284,219.15 (was €4,295,523.85), L4 €4,083,576.60 (was €4,086,831.59). Old values retained in the embedded grid data under `old_winning_superseded`, not deleted.
+
+DECISION: the €607.3k L2 figure replaced with a real sequential decomposition (Base → +cover → +bias → +min-run), each step a genuine joint engine call, sums to the total change exactly by construction. On L2 the cover reset (−€444.3k) now exceeds the min-run cut (−€197.2k) — the previous single-lever attribution to minimum run hours was both the wrong mechanism (additive vs joint) and, after re-selection, the wrong lever.
+
+DECISION: L2's selected minimum run of 2.0h labelled as the floor of the tested range on the dashboard, because it entered the grid as a slider-exploration point (added after the original Step 7 search, whose own min-run grid was {4,6,9,12}) and no lower value was ever evaluated — a cheaper feasible point below 2.0h cannot be excluded. Also noted: the 6.0h→2.0h move implies a substantial changeover-capability investment, not a scheduling change.
+
+DECISION: sequential decomposition retained with a positive-component footnote (L1 bias +€10.8k, L4 bias +€2.9k) rather than reordered to hide it, because component signs are an artefact of decomposition order while the selected point remains the argmin regardless of ordering — surfacing this is more honest than choosing an order that happens to make every term negative.
+
+DECISION: lever-ranking badges relabelled "#N by cost spread across tested range" (not "cost sensitivity"), with an explicit note that cover's tested range (1.0–10.0 weeks) is wider in practical terms than min-run's (2.0–20.0h) — spread magnitude is partly a function of range width swept, not purely intrinsic responsiveness.
+
+DECISION: L2's bias correction recorded as degenerate above 0.25 (totals identical to the cent at 0.25/0.5/0.75/1.0 = €4,500,825.65, only 0.0 differing by €857.26, confirmed against the curve holding cover at the prior winning point) — surfaced as a standing, line-conditional flag, not left implicit.
+
+DECISION: the service_target claim grounded in a specific, freshly re-verified pre-D-079 figure (L2, cover_A=5.5, service 88%→99.5%: cost +€115.8k, achieved fill 0.991→0.995) rather than the user-supplied figures (0.993→0.997, ~€114k), which could not be exactly reproduced under the closest matching methodology tried — close but not identical, likely a minor difference in which bias/min-run values that original sweep held fixed. Own verified numbers cited rather than restating unreproduced ones.
+
 
 *(pending)*
