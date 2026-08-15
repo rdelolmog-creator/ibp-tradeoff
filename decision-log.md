@@ -425,5 +425,8 @@ DECISION: the fill and overhang KPIs recomputed at the re-selected argmin, becau
 
 Provenance confirmed: `engine.assumption_fingerprint == 'v0.1:703d09b1e1a7'`, exact match to the hash the dashboard displays and to the hash used in D-081's candidate evaluation — same assumption set, same unmodified engine, throughout.
 
+**D-083 · Stale service-uniformity claim corrected**
+DECISION: the service narrative corrected to state that the cost-minimising policy accepts reduced fill on C-class slow movers, because the re-selected argmin produces 84.8% class-C fill on L2 and the prior "97.5–100% regardless" wording is contradicted by the dashboard's own class table. Verified against `best_by_class` directly: overall range across all four lines and three classes is 84.82% (L2 class C) to 100.00% (L3 class A) — L1's own range (97.53–99.95%) was accurate in isolation but the word "regardless" wrongly generalised it portfolio-wide. Corrected sentence states L1's own real range, names L2's 84.8% exception explicitly, and states the mechanism (carrying cover on a short-shelf-life product costs more than the lost margin on a slow mover) without softening it — a genuine trade-off, not a defect. Only this one sentence changed; no other narrative, layout, or data touched.
+
 
 *(pending)*
