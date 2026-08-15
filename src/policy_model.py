@@ -434,6 +434,196 @@ def joint_policy_grid(
     return cover, service
 
 
+def search_three_lever_policy(
+    engine: TradeOffEngine,
+    line_id: str,
+    cover_values: Sequence[float],
+    bias_values: Sequence[float],
+    min_run_values: Sequence[float],
+    extra_combos: Optional[Sequence[Tuple[float, float, float, float, float]]] = None,
+) -> pd.DataFrame:
+    """D-079. Full factorial over (cover_A, cover_B, cover_C, bias, min_run) —
+    service_target is FROZEN at each SKU's ABC-class default (assumptions.abc),
+    not searched. Bias and min_run are uniform per line (not per class),
+    matching how Change 1's confirmatory sweep treated them.
+
+    This replaces search_joint_policy() as the live Step 7 search. That
+    function is UNCHANGED and left in the file — the 2-lever (cover, service)
+    result it produces is retracted (D-079), not deleted, since Step 6's own
+    tests still exercise LeverSettings with a scalar service_target and
+    nothing here should touch that.
+
+    Grid size at the default n=3/3/4: 3^3 x 3 x 4 = 324 combinations per
+    line — small enough to run in seconds, unlike the earlier 2-lever
+    729-combination grid this replaces.
+    """
+    skus = engine.line_skus(line_id)
+    if not skus:
+        raise PolicyModelViolation(f"no SKUs allocated to line {line_id!r}")
+    category = str(engine.sku_master.loc[skus[0], "category"])
+    frozen_service = {
+        c: float(engine.assumptions["abc"][c]["service_floor"])
+        for c in ("A", "B", "C")
+    }
+
+    rows: List[Dict[str, Any]] = []
+    combos = set(
+        itertools.product(cover_values, cover_values, cover_values,
+                           bias_values, min_run_values)
+    )
+    for extra in extra_combos or []:
+        combos.add(tuple(round(float(v), 6) for v in extra))
+
+    for cov_a, cov_b, cov_c, bias, mrh in combos:
+        levers = LeverSettings(
+            service_target=dict(frozen_service),
+            inventory_cover_weeks={"A": cov_a, "B": cov_b, "C": cov_c},
+            forecast_bias_correction=float(bias),
+            min_run_hours=float(mrh),
+        ).validate(engine.assumptions)
+        res = engine.run_scenario(line_id, levers)
+        s = res.sku_month.merge(
+            engine.sku_master[["abc_class"]], left_on="sku_id", right_index=True
+        )
+        achieved_by_class = {
+            c: float(g["shipped_units"].sum() / g["demand_units"].sum())
+            if g["demand_units"].sum() > 0 else float("nan")
+            for c, g in s.groupby("abc_class")
+        }
+        fill_rate = 1.0 - (
+            s["lost_units"].sum() / s["demand_units"].sum()
+            if s["demand_units"].sum() > 0 else float("nan")
+        )
+        overhang_mask = (s["production_units"] == 0) & (
+            s["stock_open_units"] > s["target_stock_units"]
+        )
+        overhang_months = int(overhang_mask.sum())
+        overhang_cost_share = float(
+            (s.loc[overhang_mask, "lost_sales_eur"].sum()
+             + s.loc[overhang_mask, "excess_obsolescence_eur"].sum()
+             + s.loc[overhang_mask, "working_capital_cost_eur"].sum())
+            / max(1e-9, s["lost_sales_eur"].sum() + s["excess_obsolescence_eur"].sum()
+                  + s["working_capital_cost_eur"].sum())
+        )
+        rows.append(
+            {
+                "line_id": line_id,
+                "cover_A": cov_a, "cover_B": cov_b, "cover_C": cov_c,
+                "bias_correction": float(bias), "min_run_hours": float(mrh),
+                **res.totals,
+                "service_achieved_A": achieved_by_class.get("A", float("nan")),
+                "service_achieved_B": achieved_by_class.get("B", float("nan")),
+                "service_achieved_C": achieved_by_class.get("C", float("nan")),
+                "unit_fill_rate": fill_rate,
+                "overhang_sku_months": overhang_months,
+                "overhang_sku_months_total": int(len(s)),
+                "overhang_cost_share": overhang_cost_share,
+                "capacity_shortfall_total": float(
+                    res.line_month["capacity_shortfall_units"].sum()
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def best_feasible_three_lever(search_result: pd.DataFrame) -> pd.Series:
+    """Same feasibility-first selection rule as best_feasible_policy()."""
+    feasible = search_result[search_result["capacity_shortfall_total"] <= 1e-6]
+    if feasible.empty:
+        raise PolicyModelViolation(
+            "no combination in the three-lever grid is capacity-feasible"
+        )
+    return feasible.loc[feasible["total_economic_cost_eur"].idxmin()]
+
+
+def search_all_lines_three_lever(
+    engine: TradeOffEngine, n_cover: int = 3,
+    bias_values: Sequence[float] = (0.0, 0.5, 1.0),
+    min_run_values: Sequence[float] = (4.0, 6.0, 9.0, 12.0),
+) -> pd.DataFrame:
+    """D-079 replacement for search_all_lines(). service_target is frozen at
+    ABC defaults on every row — it is reported (service_achieved_*) never
+    searched. Base comparator is the true simultaneous per-class-default
+    scenario at bias=0, min_run=each category's own default — matching what
+    was already computed as 'true_base' during the D-071/D-072 dashboard
+    rebuild.
+    """
+    lev = engine.assumptions["levers"]
+    c_lo, c_hi = (float(v) for v in lev["inventory_cover_weeks"]["range"])
+    cover_values = [round(c_lo + i * (c_hi - c_lo) / (n_cover - 1), 4) for i in range(n_cover)]
+
+    rows: List[Dict[str, Any]] = []
+    for line_id in engine.line_master["line_id"]:
+        skus = engine.line_skus(line_id)
+        if not skus:
+            continue
+        category = str(engine.sku_master.loc[skus[0], "category"])
+        default_cover = {
+            c: float(engine.assumptions["abc"][c]["target_cover_weeks"])
+            for c in ("A", "B", "C")
+        }
+        default_min_run = float(
+            engine.assumptions["categories"][category]["min_run_hours"]
+        )
+        default_combo = (
+            default_cover["A"], default_cover["B"], default_cover["C"],
+            0.0, default_min_run,
+        )
+        search = search_three_lever_policy(
+            engine, line_id, cover_values, bias_values, min_run_values,
+            extra_combos=[default_combo],
+        )
+        best = best_feasible_three_lever(search)
+
+        base_levers = LeverSettings.defaults_per_class(engine.assumptions, category)
+        base_res = engine.run_scenario(line_id, base_levers)
+        base_total = base_res.totals["total_economic_cost_eur"]
+
+        row = best.to_dict()
+        row["default_total_cost_eur"] = base_total
+        row["saving_eur"] = base_total - best["total_economic_cost_eur"]
+        row["assumption_fingerprint"] = engine.assumption_fingerprint
+        rows.append(row)
+
+    if not rows:
+        raise PolicyModelViolation("no line produced a feasible three-lever policy")
+    return pd.DataFrame(rows)
+
+
+def bias_min_run_interaction(
+    engine: TradeOffEngine, line_id: str,
+    cover_combo: Dict[str, float],
+    bias_values: Sequence[float] = (0.0, 0.5, 1.0),
+    min_run_values: Sequence[float] = (4.0, 6.0, 9.0, 12.0),
+) -> pd.DataFrame:
+    """D-079 Change 5 reporting requirement: the bias x min_run interaction,
+    at a FIXED cover combination, shown as a full grid INCLUDING cells where
+    bias has zero effect (a real mechanism — the batch floor exceeds the
+    plan adjustment — not suppressed or smoothed)."""
+    skus = engine.line_skus(line_id)
+    category = str(engine.sku_master.loc[skus[0], "category"])
+    frozen_service = {
+        c: float(engine.assumptions["abc"][c]["service_floor"]) for c in ("A", "B", "C")
+    }
+    rows = []
+    for bias in bias_values:
+        for mrh in min_run_values:
+            levers = LeverSettings(
+                service_target=dict(frozen_service),
+                inventory_cover_weeks=dict(cover_combo),
+                forecast_bias_correction=float(bias), min_run_hours=float(mrh),
+            ).validate(engine.assumptions)
+            res = engine.run_scenario(line_id, levers)
+            rows.append({
+                "line_id": line_id, "bias_correction": bias, "min_run_hours": mrh,
+                "total_economic_cost_eur": res.totals["total_economic_cost_eur"],
+            })
+    df = pd.DataFrame(rows)
+    pivoted = df.pivot(index="min_run_hours", columns="bias_correction", values="total_economic_cost_eur")
+    pivoted["bias_has_zero_effect"] = pivoted.nunique(axis=1) == 1
+    return pivoted.reset_index()
+
+
 def search_joint_policy(
     engine: TradeOffEngine,
     line_id: str,

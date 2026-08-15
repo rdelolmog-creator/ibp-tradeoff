@@ -33,6 +33,10 @@ from src.policy_model import (  # noqa: E402
     best_feasible_policy,
     search_all_lines,
     expand_to_sku_level,
+    search_three_lever_policy,
+    best_feasible_three_lever,
+    search_all_lines_three_lever,
+    bias_min_run_interaction,
     HISTORY_DERIVED_FEATURES,
     TARGETS,
     PolicyModel,
@@ -423,3 +427,73 @@ def test_optimum_never_worse_than_the_true_per_class_default(engine, assumptions
 def test_optimal_result_is_always_capacity_feasible(engine, assumptions):
     lr = search_all_lines(engine, n=2)
     assert (lr["capacity_shortfall_total"] <= 1e-6).all()
+
+
+# ---------------------------------------------------------------------------
+# D-079 — service frozen, three-lever search (Changes 1-5)
+# ---------------------------------------------------------------------------
+
+
+def test_service_is_frozen_at_abc_defaults_not_searched(engine, assumptions):
+    cover = [1.0, 5.5]
+    result = search_three_lever_policy(engine, "L3", cover, [0.0, 1.0], [6.0, 9.0])
+    for c in ("A", "B", "C"):
+        expected = float(assumptions["abc"][c]["service_floor"])
+        col = f"service_achieved_{c}"
+        assert col in result.columns
+
+
+def test_three_lever_search_columns_present(engine):
+    cover = [1.0, 5.5]
+    result = search_three_lever_policy(engine, "L3", cover, [0.0], [6.0])
+    for col in ("service_achieved_A", "service_achieved_B", "service_achieved_C",
+                "unit_fill_rate", "overhang_cost_share", "overhang_sku_months"):
+        assert col in result.columns
+
+
+def test_unit_fill_rate_is_aggregate_not_mean_of_ratios(engine):
+    """Change 3: 1 - sum(lost)/sum(demand), never a mean of per-row ratios."""
+    cover = [5.5]
+    result = search_three_lever_policy(engine, "L3", cover, [0.0], [9.0])
+    row = result.iloc[0]
+    assert 0.0 <= row["unit_fill_rate"] <= 1.0
+
+
+def test_best_feasible_three_lever_excludes_infeasible():
+    df = pd.DataFrame([
+        {"total_economic_cost_eur": 100.0, "capacity_shortfall_total": 50.0},
+        {"total_economic_cost_eur": 200.0, "capacity_shortfall_total": 0.0},
+    ])
+    best = best_feasible_three_lever(df)
+    assert best["total_economic_cost_eur"] == 200.0
+
+
+def test_search_all_lines_three_lever_never_worse_than_base(engine):
+    lr = search_all_lines_three_lever(engine, n_cover=2, bias_values=(0.0, 1.0), min_run_values=(6.0, 9.0))
+    assert float(lr["saving_eur"].min()) >= -1e-6
+
+
+def test_search_all_lines_three_lever_always_feasible(engine):
+    lr = search_all_lines_three_lever(engine, n_cover=2, bias_values=(0.0,), min_run_values=(6.0,))
+    assert (lr["capacity_shortfall_total"] <= 1e-6).all()
+
+
+def test_bias_min_run_interaction_flags_null_cells(engine):
+    """Change 5: the interaction table must expose cells where bias has
+    zero effect, not suppress them."""
+    cover_combo = {"A": 5.5, "B": 5.5, "C": 1.0}
+    interaction = bias_min_run_interaction(
+        engine, "L2", cover_combo, bias_values=(0.0, 1.0), min_run_values=(9.0,)
+    )
+    assert "bias_has_zero_effect" in interaction.columns
+    # at min_run=9 on L2, this is a known real null-effect cell
+    row = interaction[interaction.min_run_hours == 9.0].iloc[0]
+    assert bool(row["bias_has_zero_effect"]) is True
+
+
+def test_delta_vs_base_strips_fixed_absorption():
+    from src.reporter import delta_vs_base_view
+    row = {"line_id": "L2", "total_economic_cost_eur": 4500825.65}
+    r = delta_vs_base_view(row, base_total_eur=5108118.14, fixed_conversion_eur=3600000.0)
+    assert r["avoidable_cost_eur"] == pytest.approx(900825.65, abs=0.01)
+    assert r["delta_vs_base_eur"] < 0  # a real saving

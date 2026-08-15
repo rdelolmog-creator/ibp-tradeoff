@@ -285,6 +285,36 @@ def class_breakdown_view(sku_level: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
+def delta_vs_base_view(
+    scenario_row: Dict[str, Any], base_total_eur: float, fixed_conversion_eur: float
+) -> Dict[str, Any]:
+    """D-079 Change 5. All results reported as DELTA vs base, with fixed
+    absorption stripped out before computing the delta.
+
+    Cost LEVELS shift materially with how other levers are conditioned
+    (confirmed directly against real sweep data — see the reconciliation
+    that resolved the earlier apparent L2 discrepancy: identical deltas,
+    €2.0k then €114k, reproduced across three different conditionings that
+    gave three different levels). Deltas are invariant to that conditioning;
+    levels are not. Fixed absorption (67.7% of total, D-071's search) is
+    near-inert to every lever and dominates any level-based comparison
+    without being decision-relevant, so it is stripped before the delta is
+    taken, not just noted alongside it.
+    """
+    avoidable_scenario = float(scenario_row["total_economic_cost_eur"]) - fixed_conversion_eur
+    avoidable_base = base_total_eur - fixed_conversion_eur
+    return {
+        "line_id": scenario_row["line_id"],
+        "avoidable_cost_eur": avoidable_scenario,
+        "avoidable_base_eur": avoidable_base,
+        "delta_vs_base_eur": avoidable_scenario - avoidable_base,
+        "delta_vs_base_pct": (
+            (avoidable_scenario - avoidable_base) / avoidable_base
+            if avoidable_base else float("nan")
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Portfolio brief (plain text, CFO-first paragraph)
 # ---------------------------------------------------------------------------

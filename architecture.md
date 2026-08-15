@@ -27,12 +27,14 @@ Demand Planning owns forecast quality. Supply Chain Planning owns inventory poli
 
 ### Levers (decision points, with owners)
 
-| **Lever** | **Owner** |
-| --- | --- |
-| Service target by ABC class | Supply Chain / Demand Planning |
-| Inventory policy (cover / safety stock) | Supply Chain Planning |
-| Forecast bias correction | Demand Planning / Commercial |
-| MOQ / minimum run length | Supply Chain Planning / Plant |
+**D-079: reduced from four levers to three.** `service_target` is retained on `LeverSettings` (deleting the field breaks the Step 6 test suite) but is FROZEN at each SKU's ABC-class default and no longer searched — it is reported as `service_achieved` (per line, per class) and `unit_fill_rate`, not set as a decision. Reason: service and cover both terminate in a single stock scalar (`target_stock = cover_months × plan + z(service) × cv × demand`) that every downstream cost term reads only as a total. The split between the two is unidentified from the model's own output — two different (service, cover) pairs producing the same total stock are numerically indistinguishable to every cost formula. `min_run_hours`, previously held at a per-line category default and never varied, is now the third live lever alongside cover and forecast bias correction — confirmed to dominate cover and bias by roughly two orders of magnitude in within-line cost spread.
+
+| **Lever** | **Owner** | **Status** |
+| --- | --- | --- |
+| ~~Service target by ABC class~~ | ~~Supply Chain / Demand Planning~~ | **Reported, not decided (D-079)** — frozen at ABC default, shown as achieved service and unit fill rate |
+| Inventory policy (cover / safety stock) | Supply Chain Planning | Live lever |
+| Forecast bias correction | Demand Planning / Commercial | Live lever — dominated by min-run at high batch floors; the interaction is reported explicitly, including cells where bias has zero effect |
+| MOQ / minimum run length | Supply Chain Planning / Plant | Live lever — **dominant**, ~2 orders of magnitude larger cost spread than bias correction within a single line |
 
 ### Outputs
 
@@ -266,6 +268,12 @@ This guardrail earned its place immediately: it caught a genuine leak where the 
 ---
 
 ## Revision history
+
+**v5 — four levers to three.** One change, arising from a full-grid diagnostic review that found `service_target` and `inventory_cover_weeks` are not independently identifiable from the model's own cost output.
+
+| # | Section | Change | Ref |
+|---|---|---|---|
+| 1 | §2, Levers | `service_target` removed as a decision lever, reported as an achieved output instead. Both service and cover terminate in a single `target_stock` scalar that every cost formula reads only as a total — two (service, cover) pairs giving the same total are numerically indistinguishable to the model. `min_run_hours`, previously confounded with line identity and never varied, promoted to a live lever and found to dominate cover and bias correction by roughly two orders of magnitude in within-line cost spread. Field retained on `LeverSettings` (not deleted — breaks the Step 6 suite) but frozen at ABC-class defaults. | D-079 |
 
 **v4 — Step 7 redefinition.** One change.
 
