@@ -26,8 +26,6 @@ sys.path.insert(0, str(REPO))
 
 from src.engine import LeverSettings, TradeOffEngine, build_line_master  # noqa: E402
 from src.policy_model import (  # noqa: E402
-    refine_with_candidate_set,
-    best_evaluated_policy,
     ATTRIBUTE_FEATURES,
     optimise_all_lines,
     joint_policy_grid,
@@ -504,67 +502,88 @@ def test_delta_vs_base_strips_fixed_absorption():
 # ---------------------------------------------------------------------------
 # D-081 (retroactively formalised) — candidate-set re-selection
 # ---------------------------------------------------------------------------
+# refine_with_candidate_set()/best_evaluated_policy() (the earlier draft
+# implementation these tests exercised) removed at D-087 — a single-pass
+# candidate set was found to structurally miss real improvements that only
+# become visible after another lever has already moved (verified: L1's
+# bias=0.0 is worse than bias=1.0 at the ORIGINAL cover, so a single pass
+# never adds it as a candidate, yet bias=0.0 is 10,761 EUR better once
+# cover_A has already moved to its own improving value). Superseded by
+# reselect_over_candidates()'s iterative version, which repeats the pass
+# re-centered on the new best point until a full round finds nothing
+# further — see test_reselect_* below for its coverage.
 
 
-def test_refine_with_candidate_set_never_worse_than_winner(engine):
-    winner_row = {
+# ---------------------------------------------------------------------------
+# D-081 — re-selection over a wider candidate grid
+# ---------------------------------------------------------------------------
+
+
+def test_reselect_finds_no_improvement_returns_original(engine, assumptions):
+    """When the wider candidate grid has nothing better, the original
+    winner is returned unchanged."""
+    from src.policy_model import reselect_over_candidates
+    frozen_service = {c: float(assumptions["abc"][c]["service_floor"]) for c in ("A", "B", "C")}
+    winner = {
         "line_id": "L3", "cover_A": 5.5, "cover_B": 5.5, "cover_C": 5.5,
         "bias_correction": 1.0, "min_run_hours": 9.0,
         "total_economic_cost_eur": 4295523.85,
     }
-    candidates = refine_with_candidate_set(
-        engine, "L3", winner_row, [1.0, 3.25, 5.5], [1.0], [9.0]
-    )
-    best = best_evaluated_policy(candidates)
-    assert best["total_economic_cost_eur"] <= winner_row["total_economic_cost_eur"] + 1e-6
+    # a candidate grid containing ONLY the winner's own values can't improve on it
+    result = reselect_over_candidates(engine, "L3", winner, frozen_service, [5.5], [9.0])
+    assert result["total_economic_cost_eur"] == winner["total_economic_cost_eur"]
 
 
-def test_refine_with_candidate_set_includes_original_winner(engine):
-    winner_row = {
-        "line_id": "L3", "cover_A": 5.5, "cover_B": 5.5, "cover_C": 5.5,
-        "bias_correction": 1.0, "min_run_hours": 9.0,
-        "total_economic_cost_eur": 4295523.85,
+def test_reselect_never_worse_than_winner(engine, assumptions):
+    from src.policy_model import reselect_over_candidates
+    frozen_service = {c: float(assumptions["abc"][c]["service_floor"]) for c in ("A", "B", "C")}
+    winner = {
+        "line_id": "L2", "cover_A": 5.5, "cover_B": 5.5, "cover_C": 1.0,
+        "bias_correction": 0.5, "min_run_hours": 4.0,
+        "total_economic_cost_eur": 4500825.65,
     }
-    candidates = refine_with_candidate_set(
-        engine, "L3", winner_row, [5.5], [1.0], [9.0]
+    result = reselect_over_candidates(
+        engine, "L2", winner, frozen_service, [1.0, 4.0, 5.5], [2.0, 4.0]
     )
-    assert candidates["is_original_winner"].any()
-    assert len(candidates) == 1  # no exploration alternatives supplied
+    assert result["total_economic_cost_eur"] <= winner["total_economic_cost_eur"] + 1e-6
 
 
-def test_refine_with_candidate_set_all_feasible_and_capacity_checked(engine):
-    winner_row = {
-        "line_id": "L1", "cover_A": 5.5, "cover_B": 5.5, "cover_C": 1.0,
-        "bias_correction": 1.0, "min_run_hours": 6.0,
-        "total_economic_cost_eur": 4011794.88,
+def test_reselect_result_has_full_schema(engine, assumptions):
+    """A re-selected candidate must carry every field the original search
+    row does — service_achieved_*, unit_fill_rate, overhang_* — not just
+    cover/bias/min_run/total."""
+    from src.policy_model import reselect_over_candidates
+    frozen_service = {c: float(assumptions["abc"][c]["service_floor"]) for c in ("A", "B", "C")}
+    winner = {
+        "line_id": "L2", "cover_A": 5.5, "cover_B": 5.5, "cover_C": 1.0,
+        "bias_correction": 0.5, "min_run_hours": 4.0,
+        "total_economic_cost_eur": 4500825.65,
     }
-    candidates = refine_with_candidate_set(
-        engine, "L1", winner_row, [1.0, 5.5], [1.0], [6.0]
+    result = reselect_over_candidates(
+        engine, "L2", winner, frozen_service, [1.0, 4.0, 5.5], [2.0, 4.0]
     )
-    assert "capacity_shortfall_total" in candidates.columns
-    assert (candidates["capacity_shortfall_total"] >= 0).all()
+    for key in ("service_achieved_A", "service_achieved_B", "service_achieved_C",
+                "unit_fill_rate", "overhang_cost_share", "capacity_shortfall_total"):
+        assert key in result
 
 
-def test_best_evaluated_policy_raises_when_all_infeasible():
-    df = pd.DataFrame([
-        {"total_economic_cost_eur": 100.0, "capacity_shortfall_total": 50.0},
-        {"total_economic_cost_eur": 200.0, "capacity_shortfall_total": 30.0},
-    ])
-    with pytest.raises(PolicyModelViolation):
-        best_evaluated_policy(df)
+def test_search_all_lines_three_lever_reselection_matches_known_argmin(engine):
+    """D-081's concrete counter-example: the original (pre-reselection)
+    search found L2's winner at cover_A=5.5, min_run=4.0 — but a wider
+    candidate grid contains a real, capacity-feasible, cheaper point at
+    cover_A=4.0, min_run=2.0. The canonical search function must find it."""
+    lr = search_all_lines_three_lever(engine, n_cover=3)
+    l2 = lr[lr.line_id == "L2"].iloc[0]
+    assert l2.cover_A == pytest.approx(4.0, abs=1e-6)
+    assert l2.min_run_hours == pytest.approx(2.0, abs=1e-6)
+    assert l2.total_economic_cost_eur < 4500825.65 - 1.0
 
 
-def test_refine_with_candidate_set_tolerance_ignores_rounding_noise(engine):
-    """D-081's real bug: a winner compared against itself via a coarser-
-    precision curve point must not register as 'improving' due to rounding."""
-    winner_row = {
-        "line_id": "L1", "cover_A": 5.5, "cover_B": 5.5, "cover_C": 1.0,
-        "bias_correction": 1.0, "min_run_hours": 6.0,
-        "total_economic_cost_eur": 4011794.8775604647,  # full precision, as the real search returns
-    }
-    candidates = refine_with_candidate_set(
-        engine, "L1", winner_row, [5.5], [1.0], [6.0], tolerance_eur=1.0
-    )
-    # exactly one candidate (the winner tested against itself) — must not
-    # spuriously duplicate due to float rounding treating it as "improving"
-    assert len(candidates) == 1
+def test_search_all_lines_three_lever_still_all_feasible(engine):
+    lr = search_all_lines_three_lever(engine, n_cover=3)
+    assert (lr["capacity_shortfall_total"] <= 1e-6).all()
+
+
+def test_search_all_lines_three_lever_saving_never_negative(engine):
+    lr = search_all_lines_three_lever(engine, n_cover=3)
+    assert (lr["saving_eur"] >= -1e-6).all()

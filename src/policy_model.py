@@ -536,107 +536,180 @@ def best_feasible_three_lever(search_result: pd.DataFrame) -> pd.Series:
     return feasible.loc[feasible["total_economic_cost_eur"].idxmin()]
 
 
-def refine_with_candidate_set(
-    engine: TradeOffEngine, line_id: str, winner_row: Dict[str, Any],
-    exploration_cover_values: Sequence[float], exploration_bias_values: Sequence[float],
-    exploration_min_run_values: Sequence[float], tolerance_eur: float = 1.0,
-) -> pd.DataFrame:
-    """D-081. `search_all_lines_three_lever()`'s own grid (cover {1,5.5,10},
-    bias {0,.5,1,1}, min_run {4,6,9,12}) is not the only data available — a
-    WIDER exploratory grid (used for the dashboard's sliders) can contain
-    feasible points that beat the stored winner on a one-at-a-time curve,
-    simply because they were never tested by the narrower search grid. That
-    is not a capacity constraint excluding them (verify against
-    `capacity_shortfall_total`, not assumed) — it means the stored winner is
-    not the true argmin over the wider evaluated set.
+# D-087: refine_with_candidate_set()/best_evaluated_policy() (an earlier,
+# single-pass draft) removed here — superseded by reselect_over_candidates's
+# iterative version below, which fixes a real gap the single pass had: it
+# could miss an improvement only visible after another lever had already
+# moved. See reselect_over_candidates's docstring for the verified example.
 
-    This function does NOT sum one-at-a-time deltas (that repeats the same
-    additive-attribution error D-081's Task 2 corrected). It builds a
-    candidate set — the winner, plus every one-at-a-time improvement found
-    on the exploration grid, plus every JOINT combination of those
-    improvements — and evaluates each candidate as a real, independent
-    engine call. The argmin is taken over evaluated candidates only, never
-    interpolated or summed.
 
-    tolerance_eur guards against a real precision bug found during D-081:
-    curve data stored at 2 decimals compared against a full-precision
-    winning total made the winner appear to beat itself by fractions of a
-    cent. 1.0 (one euro) is safely above that noise floor and nowhere near
-    a real economic difference.
-    """
-    frozen_service = {
-        c: float(engine.assumptions["abc"][c]["service_floor"]) for c in ("A", "B", "C")
+def _full_row_at_combo(
+    engine: TradeOffEngine, line_id: str, frozen_service: Dict[str, float],
+    cover: Dict[str, float], bias: float, mrh: float,
+) -> Dict[str, Any]:
+    """Build a full result row (matching search_three_lever_policy's schema)
+    for one specific (cover, bias, min_run) combination — used to get every
+    field (service_achieved_*, unit_fill_rate, overhang_*) at a re-selected
+    argmin, not just its total cost."""
+    levers = LeverSettings(
+        service_target=frozen_service, inventory_cover_weeks=cover,
+        forecast_bias_correction=float(bias), min_run_hours=float(mrh),
+    ).validate(engine.assumptions)
+    res = engine.run_scenario(line_id, levers)
+    s = res.sku_month.merge(
+        engine.sku_master[["abc_class"]], left_on="sku_id", right_index=True
+    )
+    achieved_by_class = {
+        c: float(g["shipped_units"].sum() / g["demand_units"].sum())
+        if g["demand_units"].sum() > 0 else float("nan")
+        for c, g in s.groupby("abc_class")
     }
-    win_cover = {c: float(winner_row[f"cover_{c}"]) for c in ("A", "B", "C")}
-    win_bias, win_mrh = float(winner_row["bias_correction"]), float(winner_row["min_run_hours"])
-    win_total = float(winner_row["total_economic_cost_eur"])
+    fill_rate = 1.0 - (
+        s["lost_units"].sum() / s["demand_units"].sum()
+        if s["demand_units"].sum() > 0 else float("nan")
+    )
+    overhang_mask = (s["production_units"] == 0) & (
+        s["stock_open_units"] > s["target_stock_units"]
+    )
+    overhang_cost_share = float(
+        (s.loc[overhang_mask, "lost_sales_eur"].sum()
+         + s.loc[overhang_mask, "excess_obsolescence_eur"].sum()
+         + s.loc[overhang_mask, "working_capital_cost_eur"].sum())
+        / max(1e-9, s["lost_sales_eur"].sum() + s["excess_obsolescence_eur"].sum()
+              + s["working_capital_cost_eur"].sum())
+    )
+    return {
+        "line_id": line_id,
+        "cover_A": cover["A"], "cover_B": cover["B"], "cover_C": cover["C"],
+        "bias_correction": float(bias), "min_run_hours": float(mrh),
+        **res.totals,
+        "service_achieved_A": achieved_by_class.get("A", float("nan")),
+        "service_achieved_B": achieved_by_class.get("B", float("nan")),
+        "service_achieved_C": achieved_by_class.get("C", float("nan")),
+        "unit_fill_rate": fill_rate,
+        "overhang_sku_months": int(overhang_mask.sum()),
+        "overhang_sku_months_total": int(len(s)),
+        "overhang_cost_share": overhang_cost_share,
+        "capacity_shortfall_total": float(
+            res.line_month["capacity_shortfall_units"].sum()
+        ),
+    }
 
-    def run(cover, bias, mrh):
+
+def _reselect_one_pass(
+    engine: TradeOffEngine, line_id: str, winner_row: Dict[str, Any],
+    frozen_service: Dict[str, float],
+    candidate_cover_values: Sequence[float], candidate_min_run_values: Sequence[float],
+    candidate_bias_values: Sequence[float], tolerance_eur: float,
+) -> Dict[str, Any]:
+    """One round of one-at-a-time-improvement-then-joint-combination,
+    centered on winner_row. See reselect_over_candidates for why a single
+    round is not sufficient on its own — D-087."""
+    win_cover = {"A": winner_row["cover_A"], "B": winner_row["cover_B"], "C": winner_row["cover_C"]}
+    win_bias = winner_row["bias_correction"]
+    win_mrh = winner_row["min_run_hours"]
+    win_total = winner_row["total_economic_cost_eur"]
+
+    def total_and_feasible(cover, bias, mrh):
         levers = LeverSettings(
             service_target=frozen_service, inventory_cover_weeks=cover,
-            forecast_bias_correction=bias, min_run_hours=mrh,
+            forecast_bias_correction=float(bias), min_run_hours=float(mrh),
         ).validate(engine.assumptions)
         res = engine.run_scenario(line_id, levers)
         shortfall = float(res.line_month["capacity_shortfall_units"].sum())
-        return round(float(res.totals["total_economic_cost_eur"]), 2), shortfall
+        return float(res.totals["total_economic_cost_eur"]), shortfall
 
-    # one-at-a-time curves, holding the OTHER four dimensions at the winner
     improving: Dict[str, List[float]] = {}
     for cls in ("A", "B", "C"):
-        alts = []
-        for cov in exploration_cover_values:
-            trial_cover = dict(win_cover); trial_cover[cls] = cov
-            total, _ = run(trial_cover, win_bias, win_mrh)
-            if total < win_total - tolerance_eur:
-                alts.append(cov)
-        improving[f"cover_{cls}"] = sorted(set(alts))
-    for bias in exploration_bias_values:
-        total, _ = run(win_cover, bias, win_mrh)
-        if total < win_total - tolerance_eur:
-            improving.setdefault("bias", []).append(bias)
-    improving.setdefault("bias", sorted(set(improving.get("bias", []))))
-    for mrh in exploration_min_run_values:
-        total, _ = run(win_cover, win_bias, mrh)
-        if total < win_total - tolerance_eur:
-            improving.setdefault("min_run", []).append(mrh)
-    improving.setdefault("min_run", sorted(set(improving.get("min_run", []))))
+        vals = []
+        for cov in candidate_cover_values:
+            cover = dict(win_cover); cover[cls] = cov
+            total, shortfall = total_and_feasible(cover, win_bias, win_mrh)
+            if shortfall <= 1e-6 and total < win_total - tolerance_eur:
+                vals.append(cov)
+        improving[f"cover_{cls}"] = sorted(set(vals))
+    mrh_vals = []
+    for mrh in candidate_min_run_values:
+        total, shortfall = total_and_feasible(win_cover, win_bias, mrh)
+        if shortfall <= 1e-6 and total < win_total - tolerance_eur:
+            mrh_vals.append(mrh)
+    improving["min_run"] = sorted(set(mrh_vals))
+    bias_vals = []
+    for bias in candidate_bias_values:
+        total, shortfall = total_and_feasible(win_cover, bias, win_mrh)
+        if shortfall <= 1e-6 and total < win_total - tolerance_eur:
+            bias_vals.append(bias)
+    improving["bias"] = sorted(set(bias_vals))
 
-    candidate_axes = {
-        "cover_A": sorted(set([win_cover["A"]] + improving.get("cover_A", []))),
-        "cover_B": sorted(set([win_cover["B"]] + improving.get("cover_B", []))),
-        "cover_C": sorted(set([win_cover["C"]] + improving.get("cover_C", []))),
-        "bias": sorted(set([win_bias] + improving.get("bias", []))),
-        "min_run": sorted(set([win_mrh] + improving.get("min_run", []))),
+    if not any(improving.values()):
+        return winner_row
+
+    axis_values = {
+        "cover_A": sorted(set([win_cover["A"]] + improving["cover_A"])),
+        "cover_B": sorted(set([win_cover["B"]] + improving["cover_B"])),
+        "cover_C": sorted(set([win_cover["C"]] + improving["cover_C"])),
+        "bias": sorted(set([win_bias] + improving["bias"])),
+        "min_run": sorted(set([win_mrh] + improving["min_run"])),
     }
-    combos = list(itertools.product(*[candidate_axes[k] for k in
-                  ("cover_A", "cover_B", "cover_C", "bias", "min_run")]))
+    combos = list(itertools.product(*[axis_values[k] for k in (
+        "cover_A", "cover_B", "cover_C", "bias", "min_run")]))
 
-    rows = []
+    best_total = win_total
+    best_combo = (win_cover["A"], win_cover["B"], win_cover["C"], win_bias, win_mrh)
     for cov_a, cov_b, cov_c, bias, mrh in combos:
-        total, shortfall = run({"A": cov_a, "B": cov_b, "C": cov_c}, bias, mrh)
-        rows.append({
-            "line_id": line_id, "cover_A": cov_a, "cover_B": cov_b, "cover_C": cov_c,
-            "bias_correction": bias, "min_run_hours": mrh,
-            "total_economic_cost_eur": total, "capacity_shortfall_total": shortfall,
-            "is_original_winner": (
-                abs(cov_a - win_cover["A"]) < 1e-6 and abs(cov_b - win_cover["B"]) < 1e-6
-                and abs(cov_c - win_cover["C"]) < 1e-6 and abs(bias - win_bias) < 1e-6
-                and abs(mrh - win_mrh) < 1e-6
-            ),
-        })
-    return pd.DataFrame(rows)
+        cover = {"A": cov_a, "B": cov_b, "C": cov_c}
+        total, shortfall = total_and_feasible(cover, bias, mrh)
+        if shortfall <= 1e-6 and total < best_total - tolerance_eur:
+            best_total = total
+            best_combo = (cov_a, cov_b, cov_c, bias, mrh)
+
+    if best_combo == (win_cover["A"], win_cover["B"], win_cover["C"], win_bias, win_mrh):
+        return winner_row
+
+    cov_a, cov_b, cov_c, bias, mrh = best_combo
+    return _full_row_at_combo(
+        engine, line_id, frozen_service, {"A": cov_a, "B": cov_b, "C": cov_c}, bias, mrh
+    )
 
 
-def best_evaluated_policy(candidates: pd.DataFrame) -> pd.Series:
-    """Argmin over evaluated candidates only, feasibility-first — same rule
-    as best_feasible_three_lever(), applied to refine_with_candidate_set()'s
-    output instead of the raw sweep grid."""
-    feasible = candidates[candidates["capacity_shortfall_total"] <= 1e-6]
-    if feasible.empty:
-        raise PolicyModelViolation(
-            "no candidate in the refined set is capacity-feasible"
+def reselect_over_candidates(
+    engine: TradeOffEngine, line_id: str, winner_row: Dict[str, Any],
+    frozen_service: Dict[str, float],
+    candidate_cover_values: Sequence[float], candidate_min_run_values: Sequence[float],
+    candidate_bias_values: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.0),
+    tolerance_eur: float = 1.0, max_iterations: int = 10,
+) -> Dict[str, Any]:
+    """D-081, corrected (D-087). A SINGLE pass of one-at-a-time-improvement-
+    then-joint-combination is not sufficient — it can miss a genuine
+    improvement that only becomes visible after ANOTHER lever has already
+    moved. Verified concretely: at L1's original cover, bias=0.0 is WORSE
+    than bias=1.0 (4,018,465.61 vs 4,011,794.88), so a single pass correctly
+    finds no bias improvement there and never adds it to the candidate set
+    — but once cover_A moves to its own improving value (4.0), bias=0.0
+    becomes 10,761 EUR better than bias=1.0 at that new point. A one-shot
+    candidate set built entirely around the original winner structurally
+    cannot see this.
+
+    Fixed by iterating: repeat the one-at-a-time-then-combine pass,
+    RE-CENTERED on the new best point each round, until a full round finds
+    no further improvement (standard coordinate-descent-style local search
+    over a discrete grid) or max_iterations is reached. Not guaranteed to
+    reach the true global optimum over the full continuous space — nothing
+    here claims to be a continuous optimisation — but it no longer stops
+    after a single pass that provably missed a real, verified improvement.
+    """
+    current = dict(winner_row)
+    for _ in range(max_iterations):
+        refined = _reselect_one_pass(
+            engine, line_id, current, frozen_service,
+            candidate_cover_values, candidate_min_run_values,
+            candidate_bias_values, tolerance_eur,
         )
-    return feasible.loc[feasible["total_economic_cost_eur"].idxmin()]
+        if refined is current or refined["total_economic_cost_eur"] >= current["total_economic_cost_eur"] - tolerance_eur:
+            break
+        current = refined
+    return current
+
 
 
 def search_all_lines_three_lever(
@@ -650,10 +723,23 @@ def search_all_lines_three_lever(
     scenario at bias=0, min_run=each category's own default — matching what
     was already computed as 'true_base' during the D-071/D-072 dashboard
     rebuild.
+
+    D-081: after the grid search's own winner is found, re-selected over a
+    wider, independently-spaced candidate grid (reselect_over_candidates) —
+    the original grid alone was found NOT to contain the true argmin on
+    every line; see D-081 for the concrete counter-examples that surfaced
+    this.
     """
     lev = engine.assumptions["levers"]
     c_lo, c_hi = (float(v) for v in lev["inventory_cover_weeks"]["range"])
     cover_values = [round(c_lo + i * (c_hi - c_lo) / (n_cover - 1), 4) for i in range(n_cover)]
+    candidate_cover_values = sorted(set(
+        round(c_lo + i * (c_hi - c_lo) / 4, 4) for i in range(5)
+    ))
+    mrh_lo, mrh_hi = (float(v) for v in lev["min_run_hours"]["range"])
+    candidate_min_run_values = sorted(set(
+        round(mrh_lo + i * (mrh_hi - mrh_lo) / 4, 2) for i in range(5)
+    ))
 
     rows: List[Dict[str, Any]] = []
     for line_id in engine.line_master["line_id"]:
@@ -677,6 +763,18 @@ def search_all_lines_three_lever(
             extra_combos=[default_combo],
         )
         best = best_feasible_three_lever(search)
+
+        frozen_service = {
+            c: float(engine.assumptions["abc"][c]["service_floor"]) for c in ("A", "B", "C")
+        }
+        line_candidate_cover = sorted(set(
+            candidate_cover_values + [default_cover["A"], default_cover["B"], default_cover["C"]]
+        ))
+        line_candidate_mrh = sorted(set(candidate_min_run_values + [default_min_run]))
+        best = pd.Series(reselect_over_candidates(
+            engine, line_id, best.to_dict(), frozen_service,
+            line_candidate_cover, line_candidate_mrh,
+        ))
 
         base_levers = LeverSettings.defaults_per_class(engine.assumptions, category)
         base_res = engine.run_scenario(line_id, base_levers)
