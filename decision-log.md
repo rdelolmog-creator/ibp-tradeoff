@@ -396,5 +396,12 @@ DECISION: all results reported as delta vs base, with fixed absorption (67.7% of
 
 **Not done this turn, stated plainly rather than left ambiguous:** the HTML dashboard (service sliders, results tables) has not yet been updated to match — it still presents service as a live decision lever. This is the next piece of work, not a completed item.
 
+**D-080 · Step 9 notebook rebuilt for D-079's three-lever shape; export_artefacts' class_breakdown slot renamed to delta_vs_base**
+DECISION: `line_policy_brief()` (D-071, columns `service_A/B/C`) is retired — the search no longer produces those columns, since service is frozen. `line_policy_brief_three_lever()` replaces it in `src/reporter.py`: one row per (line, class), `cover_weeks` as the real per-class decision, `service_achieved` as the real per-class outcome (not settable), `bias_correction`/`min_run_hours` repeated per line since they are not class-specific.
+
+Caught before running: `export_artefacts()`'s third parameter was still named and hard-coded to write `class_breakdown.csv`. Passing the new delta-vs-base table into that slot would have produced a file named `class_breakdown.csv` containing delta rows — a real naming lie, not a cosmetic issue. Renamed the parameter and output file to `delta_vs_base_df` / `delta_vs_base.csv`. The existing D-072 test for this function was unaffected (asserts generically over `paths.values()`, not specific keys).
+
+Notebook executed end to end in sandbox before push: 125 tests across five suites, all 7 consolidated-report checks PASS, `class_breakdown.csv` correctly absent from the export in favour of `delta_vs_base.csv`.
+
 
 *(pending)*

@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO))
 
 from src.engine import LeverSettings, TradeOffEngine  # noqa: E402
 from src.reporter import (  # noqa: E402
+    line_policy_brief_three_lever,
     ReporterViolation,
     avoidable_cost_view,
     capacity_warning,
@@ -369,3 +370,45 @@ def test_reporter_does_not_recompute_engine_outputs():
 def test_ground_truth_not_importable():
     text = (REPO / "src" / "reporter.py").read_text()
     assert "ground_truth" not in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# D-079 — line_policy_brief_three_lever
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def toy_line_results_three_lever():
+    return pd.DataFrame({
+        "line_id": ["L1", "L2"],
+        "cover_A": [5.5, 5.5], "cover_B": [5.5, 5.5], "cover_C": [1.0, 1.0],
+        "bias_correction": [1.0, 0.5], "min_run_hours": [6.0, 4.0],
+        "service_achieved_A": [1.0, 0.9996], "service_achieved_B": [0.9995, 0.9981],
+        "service_achieved_C": [0.9753, 0.9395],
+        "unit_fill_rate": [0.9977, 0.9960], "overhang_cost_share": [0.7119, 0.7722],
+        "total_economic_cost_eur": [4011794.88, 4500825.65],
+        "default_total_cost_eur": [4056457.21, 5108118.14],
+        "saving_eur": [44662.33, 607292.49],
+    })
+
+
+def test_line_policy_brief_three_lever_no_service_decision_column(toy_line_results_three_lever):
+    """service_target must not appear as a settable decision column — only
+    service_achieved, an outcome."""
+    lpb = line_policy_brief_three_lever(toy_line_results_three_lever)
+    assert "service_target" not in lpb.columns
+    assert "service_achieved" in lpb.columns
+
+
+def test_line_policy_brief_three_lever_bias_and_minrun_repeat_per_class(toy_line_results_three_lever):
+    """bias_correction and min_run_hours are line-level, not class-level —
+    every class row for a line must show the identical value."""
+    lpb = line_policy_brief_three_lever(toy_line_results_three_lever)
+    l1 = lpb[lpb.line_id == "L1"]
+    assert l1["bias_correction"].nunique() == 1
+    assert l1["min_run_hours"].nunique() == 1
+
+
+def test_line_policy_brief_three_lever_row_count(toy_line_results_three_lever):
+    lpb = line_policy_brief_three_lever(toy_line_results_three_lever)
+    assert len(lpb) == len(toy_line_results_three_lever) * 3

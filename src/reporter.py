@@ -315,6 +315,36 @@ def delta_vs_base_view(
     }
 
 
+def line_policy_brief_three_lever(line_results: pd.DataFrame) -> pd.DataFrame:
+    """D-079 replacement for line_policy_brief(). service_target is no
+    longer a column to report as a decision — it is frozen at the ABC
+    default and reported as service_achieved_* instead. One row per
+    (line, class): cover_weeks is the real per-class decision;
+    service_achieved is the real per-class OUTCOME, not set; bias_correction
+    and min_run_hours are line-level decisions, repeated across each class's
+    row since they are not class-specific.
+    """
+    rows: List[Dict[str, Any]] = []
+    for _, r in line_results.iterrows():
+        for cls in ("A", "B", "C"):
+            rows.append(
+                {
+                    "line_id": r["line_id"],
+                    "abc_class": cls,
+                    "cover_weeks": float(r[f"cover_{cls}"]),
+                    "service_achieved": float(r[f"service_achieved_{cls}"]),
+                    "bias_correction": float(r["bias_correction"]),
+                    "min_run_hours": float(r["min_run_hours"]),
+                    "unit_fill_rate": float(r["unit_fill_rate"]),
+                    "overhang_cost_share": float(r["overhang_cost_share"]),
+                    "line_total_cost_eur": float(r["total_economic_cost_eur"]),
+                    "line_default_cost_eur": float(r["default_total_cost_eur"]),
+                    "line_saving_eur": float(r["saving_eur"]),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------------------
 # Portfolio brief (plain text, CFO-first paragraph)
 # ---------------------------------------------------------------------------
@@ -380,12 +410,19 @@ def portfolio_brief(
 def export_artefacts(
     avoidable_view: Dict[str, float],
     line_policy_brief_df: pd.DataFrame,
-    class_breakdown_df: pd.DataFrame,
+    delta_vs_base_df: pd.DataFrame,
     portfolio_brief_text: str,
     out_dir: str,
 ) -> Dict[str, str]:
-    """Write the reporter artefacts. No plotting dependency — Step 10
-    (Streamlit) owns visualisation; this module owns the numbers."""
+    """Write the reporter artefacts. No plotting dependency — the app owns
+    visualisation; this module owns the numbers.
+
+    D-079: the third slot was class_breakdown_df (D-072's per-class output,
+    retired alongside the 2-lever search it was built for). It is now
+    delta_vs_base_df — the file name changes with it, since a file called
+    class_breakdown.csv containing delta-vs-base rows would be a real
+    naming lie, not just a cosmetic mismatch.
+    """
     os.makedirs(out_dir, exist_ok=True)
     paths: Dict[str, str] = {}
 
@@ -397,9 +434,9 @@ def export_artefacts(
     line_policy_brief_df.to_csv(p2, index=False)
     paths["line_policy_brief"] = p2
 
-    p3 = os.path.join(out_dir, "class_breakdown.csv")
-    class_breakdown_df.to_csv(p3, index=False)
-    paths["class_breakdown"] = p3
+    p3 = os.path.join(out_dir, "delta_vs_base.csv")
+    delta_vs_base_df.to_csv(p3, index=False)
+    paths["delta_vs_base"] = p3
 
     p4 = os.path.join(out_dir, "portfolio_brief.txt")
     with open(p4, "w") as f:
