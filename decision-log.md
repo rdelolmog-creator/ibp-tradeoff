@@ -420,5 +420,10 @@ DECISION: L2's bias correction recorded as degenerate above 0.25 (totals identic
 
 DECISION: the service_target claim grounded in a specific, freshly re-verified pre-D-079 figure (L2, cover_A=5.5, service 88%→99.5%: cost +€115.8k, achieved fill 0.991→0.995) rather than the user-supplied figures (0.993→0.997, ~€114k), which could not be exactly reproduced under the closest matching methodology tried — close but not identical, likely a minor difference in which bias/min-run values that original sweep held fixed. Own verified numbers cited rather than restating unreproduced ones.
 
+**D-082 · Fill and overhang KPIs recomputed at the re-selected argmin (D-081 left them stale)**
+DECISION: the fill and overhang KPIs recomputed at the re-selected argmin, because both were captioned "at Best evaluated policy" while carrying values computed at the superseded winning point from before D-081's Task 1 re-selection. Old values (computed at the pre-re-selection winner): fill {L1:0.9977, L2:0.9960, L3:0.9998, L4:0.9983}, overhang {L1:0.7119, L2:0.7722, L3:0.8208, L4:0.6718}. New values, computed via a real engine run at each line's exact argmin (L1 cover(4.0,5.5,1.0) bias 1.0 mrh 6.0; L2 cover(4.0,5.5,1.0) bias 0.5 mrh 2.0; L3 cover(5.5,5.5,3.25) bias 1.0 mrh 9.0; L4 cover(4.0,5.5,3.25) bias 1.0 mrh 6.0): fill {L1:0.9900, L2:0.9763, L3:0.9988, L4:0.9911}, overhang {L1:0.7243, L2:0.7272, L3:0.8307, L4:0.6552}. Each run's total_economic_cost_eur cross-checked against the already-verified argmin total for that line before accepting the fill/overhang figures from the same run.
+
+Provenance confirmed: `engine.assumption_fingerprint == 'v0.1:703d09b1e1a7'`, exact match to the hash the dashboard displays and to the hash used in D-081's candidate evaluation — same assumption set, same unmodified engine, throughout.
+
 
 *(pending)*
